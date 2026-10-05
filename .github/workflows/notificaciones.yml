@@ -10,26 +10,29 @@ permissions:
 
 jobs:
   enviar-notificaciones:
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
+    runs-on: ubuntu-slim
+    timeout-minutes: 6
 
     steps:
       - name: Descargar código
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Configurar Node.js 22
-        uses: actions/setup-node@v4
+      - name: Configurar Node.js 24
+        uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
+          cache: 'npm'
+          cache-dependency-path: server/package.json
 
       - name: Instalar dependencias
         working-directory: server
-        run: npm install --omit=dev
+        run: npm install --omit=dev --no-audit --no-fund
 
-      - name: Ejecutar revisión de notificaciones
+      - name: Ejecutar una revisión de notificaciones
         working-directory: server
         env:
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
           APP_TIMEZONE: America/Caracas
           PUBLIC_APP_URL: https://cronogramas-oasis.netlify.app/
-        run: node server.js
+          RUN_ONCE: 'true'
+        run: node server.js --once

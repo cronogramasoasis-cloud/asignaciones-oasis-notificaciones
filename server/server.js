@@ -14,6 +14,7 @@ const APP_TIMEZONE = process.env.APP_TIMEZONE || 'America/Caracas';
 const PUBLIC_APP_URL = process.env.PUBLIC_APP_URL || 'https://cronogramas-oasis.netlify.app/';
 const PORT = Number(process.env.PORT || 3000);
 const CRON_SCHEDULE = process.env.CRON_SCHEDULE || '* * * * *';
+const RUN_ONCE = process.env.RUN_ONCE === 'true' || process.argv.includes('--once');
 
 const DAY_BEFORE_HOUR = Number(process.env.ENSAYO_AVISO_DIA_ANTERIOR_HORA ?? 18);
 const DAY_BEFORE_MINUTE = Number(process.env.ENSAYO_AVISO_DIA_ANTERIOR_MINUTO ?? 0);
@@ -70,11 +71,14 @@ app.get('/health', (_req, res) => {
 });
 app.get('/', (_req, res) => res.status(200).send('Asignaciones Oasis — servidor de notificaciones activo.'));
 
-const server = app.listen(PORT, () => {
-  console.log(`[NOTIFICACIONES] Servidor escuchando en puerto ${PORT}.`);
-  console.log(`[NOTIFICACIONES] Zona horaria: ${APP_TIMEZONE}.`);
-  console.log(`[NOTIFICACIONES] Cron: ${CRON_SCHEDULE}.`);
-});
+let server = null;
+if (!RUN_ONCE) {
+  server = app.listen(PORT, () => {
+    console.log(`[NOTIFICACIONES] Servidor escuchando en puerto ${PORT}.`);
+    console.log(`[NOTIFICACIONES] Zona horaria: ${APP_TIMEZONE}.`);
+    console.log(`[NOTIFICACIONES] Cron: ${CRON_SCHEDULE}.`);
+  });
+}
 
 let cronEnCurso = false;
 
@@ -512,14 +516,29 @@ async function ejecutarRevision() {
   }
 }
 
-cron.schedule(CRON_SCHEDULE, ejecutarRevision, { timezone: APP_TIMEZONE });
+if (RUN_ONCE) {
+  // GitHub Actions ejecuta el programa como una tarea puntual.
+  // Al terminar la revisión, el proceso sale para liberar el runner.
+  ejecutarRevision()
+    .then(() => process.exit(0))
+    .catch(error => {
+      console.error('[NOTIFICACIONES] Error inicial:', error);
+      process.exit(1);
+    });
+} else {
+  cron.schedule(CRON_SCHEDULE, ejecutarRevision, { timezone: APP_TIMEZONE });
 
-// Revisión de arranque sin bloquear el servidor. La línea base evita emitir
-// notificaciones históricas al instalar el backend por primera vez.
-ejecutarRevision().catch(error => console.error('[NOTIFICACIONES] Error inicial:', error));
+  // Revisión de arranque sin bloquear el servidor. La línea base evita emitir
+  // notificaciones históricas al instalar el backend por primera vez.
+  ejecutarRevision().catch(error => console.error('[NOTIFICACIONES] Error inicial:', error));
+}
 
 function cierre() {
   console.log('[NOTIFICACIONES] Cerrando servidor...');
+  if (!server) {
+    process.exit(0);
+    return;
+  }
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 5000).unref();
 }

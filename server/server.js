@@ -508,6 +508,21 @@ async function procesarAsignaciones(now) {
             : 'asignacion_mismo_dia';
 
         for (const uid of ids) {
+          // Releer el horario justo antes de enviar: la consulta inicial puede
+          // quedar desactualizada si alguien fue retirado del equipo durante
+          // esta misma revisión.
+          const horarioActual = await docSnap.ref.get();
+          if (!horarioActual.exists) continue;
+          const datosHorarioActual = horarioActual.data() || {};
+          const equipoActual = Array.isArray(datosHorarioActual.equipo)
+            ? datosHorarioActual.equipo
+            : [];
+          const sigueAsignado = equipoActual.some(miembro => miembro?.id_usuario === uid);
+          if (!sigueAsignado) {
+            console.log(`[NOTIFICACIONES] Recordatorio omitido: uid=${uid} ya no figura en equipo del horario ${docSnap.id}.`);
+            continue;
+          }
+
           const destinatarios = await obtenerDestinatarios([uid]);
           const eventKey = `asignacion_recordatorio|${docSnap.id}|${uid}|${fechaServicio.toISODate()}|${modo}`;
           const sent = await enviarEventoUnico(eventKey, {

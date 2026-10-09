@@ -426,58 +426,101 @@ async function procesarCanciones(now, initializedAtMs) {
 }
 
 
-async function procesarAsignaciones(now, initializedAtMs) {
+function momentoAvisoCalendario(fechaEvento, now) {
+  if (!fechaEvento || !fechaEvento.isValid || !now || !now.isValid) return null;
+  const afterOrAt = (hour, minute) =>
+    now.hour > hour || (now.hour === hour && now.minute >= minute);
+
+  const diaAnterior = fechaEvento.minus({ days: 1 });
+  if (now.hasSame(diaAnterior, 'day') && afterOrAt(DAY_BEFORE_HOUR, DAY_BEFORE_MINUTE)) {
+    return 'dia_anterior';
+  }
+  if (now.hasSame(fechaEvento, 'day') && afterOrAt(SAME_DAY_HOUR, SAME_DAY_MINUTE)) {
+    return 'mismo_dia';
+  }
+  return null;
+}
+
+async function obtenerMesesConHorariosVisibles() {
+  const snap = await db.collection('publicaciones_horarios').where('visible', '==', true).get();
+  return new Set(snap.docs.map(docSnap => {
+    const data = docSnap.data() || {};
+    return String(data.mes_anio || docSnap.id);
+  }));
+}
+
+async function procesarAsignaciones(now) {
   const monthKeys = [numeroMesClave(now), mesSiguienteClave(now)];
-  const snapshots = await Promise.all(monthKeys.map(key =>
-    db.collection('horarios_servicios').where('mes_anio', '==', key).get()
-  ));
+  const [snapshots, mesesVisibles] = await Promise.all([
+    Promise.all(monthKeys.map(key => db.collection('horarios_servicios').where('mes_anio', '==', key).get())),
+    obtenerMesesConHorariosVisibles()
+  ]);
   let procesadas = 0;
 
   for (const snap of snapshots) {
     for (const docSnap of snap.docs) {
       const data = docSnap.data() || {};
+      if (!mesesVisibles.has(String(data.mes_anio || ''))) continue;
       if (data.actualizado_por_reinicio_disponibilidad === true) continue;
-      const creadoMs = toMillis(data.creado_el);
-      const actualizadoMs = toMillis(data.actualizado_el);
-      const eventoMs = actualizadoMs || creadoMs;
-      if (eventoMs === null || eventoMs <= initializedAtMs) continue;
-
-      const equipo = Array.isArray(data.equipo) ? data.equipo : [];
-      const ids = [...new Set(equipo.map(m => m?.id_usuario).filter(Boolean))];
-      if (!ids.length) continue;
 
       const info = parseMesAnio(data.mes_anio);
       const dia = Number(data.dia);
-      const fechaServicio = info && Number.isInteger(dia)
-        ? DateTime.fromObject({ year: info.anio, month: info.mes, day: dia }, { zone: APP_TIMEZONE })
-        : null;
-      const fechaTexto = fechaServicio?.isValid ? formatoFecha(fechaServicio) : `día ${dia}`;
-      const esNueva = creadoMs !== null && (actualizadoMs === null || creadoMs >= actualizadoMs);
-      const eventKey = `asignacion|${docSnap.id}|${eventoMs}`;
-      const destinatarios = await obtenerDestinatarios(ids);
+      if (!info || !Number.isInteger(dia)) continue;
+      const fechaServicio = DateTime.fromObject({
+        year: info.anio,
+        month: info.mes,
+        day: dia
+      }, { zone: APP_TIMEZONE }).startOf('day');
+      if (!fechaServicio.isValid) continue;
 
-      const sent = await enviarEventoUnico(eventKey, {
-        title: esNueva ? '📅 Nueva asignación' : '📅 Asignación actualizada',
-        body: `${esNueva ? 'Tienes una nueva asignación' : 'Se actualizó tu asignación'} para ${data.descripcion_servicio || 'el servicio'} — ${fechaTexto}.`,
-        type: esNueva ? 'nueva_asignacion' : 'asignacion_actualizada',
-        extra: { horarioId: docSnap.id }
-      }, destinatarios);
-      if (sent) procesadas += 1;
+      // Las asignaciones NO avisan al guardarse: solo se recuerda el día anterior
+      // y el mismo día del servicio, a las horas configuradas.
+      const modo = momentoAvisoCalendario(fechaServicio, now);
+      if (!modo) continue;
+
+      const equipo = Array.isArray(data.equipo) ? data.equipo : [];
+      const ids = [...new Set(equipo.map(miembro => miembro?.id_usuario).filter(Boolean))];
+      if (!ids.length) continue;
+
+      const fechaTexto = formatoFecha(fechaServicio);
+      const servicio = data.descripcion_servicio || 'el servicio';
+      const esDiaAnterior = modo === 'dia_anterior';
+      const title = esDiaAnterior ? '📅 Mañana tienes asignación' : '📅 Hoy tienes asignación';
+      const body = `${esDiaAnterior ? 'Mañana tienes asignación' : 'Hoy tienes asignación'} para el ${fechaTexto} en ${servicio}.`;
+
+      // Un evento por persona: los destinatarios solo son integrantes asignados y
+      // un fallo con un usuario no impide que los demás reciban su recordatorio.
+      for (const uid of ids) {
+        const destinatarios = await obtenerDestinatarios([uid]);
+        const eventKey = `asignacion_recordatorio|${docSnap.id}|${uid}|${fechaServicio.toISODate()}|${modo}`;
+        const sent = await enviarEventoUnico(eventKey, {
+          title,
+          body,
+          type: esDiaAnterior ? 'asignacion_dia_anterior' : 'asignacion_mismo_dia',
+          extra: { horarioId: docSnap.id, uid, fechaServicio: fechaServicio.toISODate(), momento: modo }
+        }, destinatarios);
+        if (sent) procesadas += 1;
+      }
     }
   }
   return procesadas;
 }
 
-async function procesarEnsayos(now, initializedAtMs) {
+async function procesarEnsayos(now) {
   const monthKeys = [numeroMesClave(now), mesSiguienteClave(now)];
-  const snapshots = await Promise.all(monthKeys.map(key => db.collection('ensayos_servicios').where('mes_anio', '==', key).get()));
+  const [snapshots, mesesVisibles] = await Promise.all([
+    Promise.all(monthKeys.map(key => db.collection('ensayos_servicios').where('mes_anio', '==', key).get())),
+    obtenerMesesConHorariosVisibles()
+  ]);
   let procesadas = 0;
 
   for (const snap of snapshots) {
     for (const docSnap of snap.docs) {
       const data = docSnap.data() || {};
+      // Los ensayos solo generan recordatorios una vez visibles los horarios del mes.
+      if (!mesesVisibles.has(String(data.mes_anio || ''))) continue;
       const ensayoDt = fechaEnsayo(data);
-      if (!ensayoDt || ensayoDt < now.minus({ days: 2 }) || ensayoDt > now.plus({ months: 2 })) continue;
+      if (!ensayoDt || ensayoDt < now.startOf('day') || ensayoDt > now.plus({ months: 2 })) continue;
 
       const serviceKey = data.dia_servicio;
       const serviceSnap = await db.collection('horarios_servicios')
@@ -486,42 +529,88 @@ async function procesarEnsayos(now, initializedAtMs) {
         .get();
       if (serviceSnap.empty) continue;
 
-      const horario = serviceSnap.docs[0];
+      // Si hay varios servicios el mismo día, asociar el ensayo al servicio
+      // indicado en el propio documento. No avisar a un equipo ajeno por usar
+      // arbitrariamente el primer horario de esa fecha.
+      const nombreServicioEsperado = String(data.nombre_servicio || '').trim().toLocaleLowerCase('es');
+      const horarioCoincidente = nombreServicioEsperado
+        ? serviceSnap.docs.find(doc => String(doc.data()?.descripcion_servicio || '').trim().toLocaleLowerCase('es') === nombreServicioEsperado)
+        : null;
+      const horario = horarioCoincidente || (serviceSnap.size === 1 ? serviceSnap.docs[0] : null);
+      if (!horario) {
+        console.warn(`[NOTIFICACIONES] No se pudo identificar el servicio correcto para el ensayo ${docSnap.id}; no se enviará a un equipo ambiguo.`);
+        continue;
+      }
       const horarioData = horario.data() || {};
-      const ids = (Array.isArray(horarioData.equipo) ? horarioData.equipo : [])
-        .map(m => m?.id_usuario)
-        .filter(Boolean);
+      const ids = [...new Set((Array.isArray(horarioData.equipo) ? horarioData.equipo : [])
+        .map(miembro => miembro?.id_usuario)
+        .filter(Boolean))];
       if (!ids.length) continue;
 
-      const fechaAvisoDiaAnterior = ensayoDt.minus({ days: 1 });
-      const afterOrAt = (hour, minute) => now.hour > hour || (now.hour === hour && now.minute >= minute);
-      const dueDayBefore = now.hasSame(fechaAvisoDiaAnterior, 'day')
-        && afterOrAt(DAY_BEFORE_HOUR, DAY_BEFORE_MINUTE);
-      const dueSameDay = now.hasSame(ensayoDt, 'day')
-        && afterOrAt(SAME_DAY_HOUR, SAME_DAY_MINUTE);
+      const modo = momentoAvisoCalendario(ensayoDt, now);
+      if (!modo) continue;
 
-      if (!dueDayBefore && !dueSameDay) continue;
+      const infoServicio = parseMesAnio(data.mes_anio);
+      const diaServicio = Number(serviceKey);
+      const fechaServicio = infoServicio && Number.isInteger(diaServicio)
+        ? DateTime.fromObject({ year: infoServicio.anio, month: infoServicio.mes, day: diaServicio }, { zone: APP_TIMEZONE })
+        : null;
+      const fechaServicioTexto = fechaServicio?.isValid ? formatoFecha(fechaServicio) : `día ${serviceKey}`;
+      const fechaEnsayoTexto = formatoFecha(ensayoDt);
+      const esDiaAnterior = modo === 'dia_anterior';
+      const title = esDiaAnterior ? '🎵 Mañana tienes ensayo' : '🎵 Hoy tienes ensayo';
+      const body = `${esDiaAnterior ? 'Mañana tienes ensayo' : 'Hoy tienes ensayo'} para el servicio del ${fechaServicioTexto}. El ensayo es el ${fechaEnsayoTexto} a las ${data.hora_ensayo || 'hora pendiente'}.`;
 
-      // La línea base debe compararse con la hora programada del aviso, no con
-      // la hora del ensayo. Si un ensayo es por la mañana, comparar ensayoDt
-      // podría suprimir indebidamente el recordatorio de las 08:00.
-      const eventoReferencia = dueDayBefore
-        ? fechaAvisoDiaAnterior.set({ hour: DAY_BEFORE_HOUR, minute: DAY_BEFORE_MINUTE, second: 0, millisecond: 0 })
-        : ensayoDt.set({ hour: SAME_DAY_HOUR, minute: SAME_DAY_MINUTE, second: 0, millisecond: 0 });
-      if (eventoReferencia.toMillis() <= initializedAtMs) continue;
-
-      const modo = dueDayBefore ? 'dia_anterior' : 'mismo_dia';
-      const eventKey = `ensayo|${data.mes_anio}|${serviceKey}|${data.dia_ensayo}|${data.hora_ensayo}|${modo}`;
-      const destinatarios = await obtenerDestinatarios(ids);
-      const fechaTexto = formatoFecha(ensayoDt);
-      const sent = await enviarEventoUnico(eventKey, {
-        title: dueDayBefore ? '🎵 Ensayo mañana' : '🎵 Ensayo hoy',
-        body: `${horarioData.descripcion_servicio || data.nombre_servicio || 'Servicio'}: ensayo ${dueDayBefore ? 'mañana' : 'hoy'} ${fechaTexto} a las ${data.hora_ensayo || 'hora pendiente'}.`,
-        type: dueDayBefore ? 'aviso_ensayo_dia_anterior' : 'aviso_ensayo_mismo_dia',
-        extra: { horarioId: horario.id }
-      }, destinatarios);
-      if (sent) procesadas += 1;
+      // Cada integrante asignado tiene su propia clave de idempotencia. Así, el
+      // éxito de un integrante no bloquea reintentos para otro que haya fallado.
+      for (const uid of ids) {
+        const destinatarios = await obtenerDestinatarios([uid]);
+        const eventKey = `ensayo_recordatorio|${data.mes_anio}|${serviceKey}|${data.dia_ensayo}|${data.hora_ensayo}|${uid}|${modo}`;
+        const sent = await enviarEventoUnico(eventKey, {
+          title,
+          body,
+          type: esDiaAnterior ? 'aviso_ensayo_dia_anterior' : 'aviso_ensayo_mismo_dia',
+          extra: { horarioId: horario.id, ensayoId: docSnap.id, uid, momento: modo }
+        }, destinatarios);
+        if (sent) procesadas += 1;
+      }
     }
+  }
+  return procesadas;
+}
+
+async function procesarPublicacionHorarios() {
+  const snap = await db.collection('publicaciones_horarios').where('visible', '==', true).get();
+  let procesadas = 0;
+
+  for (const docSnap of snap.docs) {
+    const data = docSnap.data() || {};
+    const mesClave = String(data.mes_anio || docSnap.id);
+    const visibleMs = toMillis(data.visible_en);
+    if (visibleMs === null) {
+      console.warn(`[NOTIFICACIONES] Publicación ${mesClave} visible sin visible_en; no se enviará un aviso duplicable.`);
+      continue;
+    }
+
+    // Releer justo antes de enviar: si un operador ocultó el mes después de la
+    // consulta inicial, no se anuncia como visible.
+    const estadoActual = await docSnap.ref.get();
+    const estadoActualData = estadoActual.data() || {};
+    if (!estadoActual.exists || estadoActualData.visible !== true || toMillis(estadoActualData.visible_en) !== visibleMs) continue;
+
+    const info = parseMesAnio(mesClave);
+    const mesTexto = info
+      ? DateTime.fromObject({ year: info.anio, month: info.mes, day: 1 }, { zone: APP_TIMEZONE }).setLocale('es').toFormat("LLLL 'de' yyyy")
+      : mesClave;
+    const eventKey = `horarios_visibles|${mesClave}|${visibleMs}`;
+    const destinatarios = await obtenerTodosDestinatarios();
+    const sent = await enviarEventoUnico(eventKey, {
+      title: '📅 ¡Los horarios ya están visibles!',
+      body: `Los horarios de ${mesTexto} ya están visibles. Entra en Oasis App para consultar tus asignaciones y ensayos.`,
+      type: 'horarios_visibles',
+      extra: { mes_anio: mesClave, publicacionId: `${mesClave}-${visibleMs}` }
+    }, destinatarios);
+    if (sent) procesadas += 1;
   }
   return procesadas;
 }
@@ -572,9 +661,10 @@ async function ejecutarRevision() {
     const resultados = await Promise.allSettled([
       procesarSuplencias(inicio, initializedAtMs),
       procesarCanciones(inicio, initializedAtMs),
-      procesarAsignaciones(inicio, initializedAtMs),
-      procesarEnsayos(inicio, initializedAtMs),
-      procesarAperturaMesSiguiente(inicio, initializedAtMs)
+      procesarAsignaciones(inicio),
+      procesarEnsayos(inicio),
+      procesarAperturaMesSiguiente(inicio, initializedAtMs),
+      procesarPublicacionHorarios()
     ]);
     const errores = resultados.filter(resultado => resultado.status === 'rejected');
     if (errores.length) {
@@ -583,10 +673,10 @@ async function ejecutarRevision() {
         `${errores.length} proceso(s) de notificación fallaron.`
       );
     }
-    const [suplencias, canciones, asignaciones, ensayos, aperturaMes] = resultados.map(resultado => resultado.value);
+    const [suplencias, canciones, asignaciones, ensayos, aperturaMes, publicacionHorarios] = resultados.map(resultado => resultado.value);
 
     await actualizarUltimaRevision(estado.ref);
-    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} asignaciones=${asignaciones} ensayos=${ensayos} aperturaMes=${aperturaMes}`);
+    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} asignaciones=${asignaciones} ensayos=${ensayos} aperturaMes=${aperturaMes} publicacionHorarios=${publicacionHorarios}`);
   } catch (error) {
     console.error('[NOTIFICACIONES] Error durante la revisión:', error);
     // En GitHub Actions --once debe devolver un código distinto de cero si

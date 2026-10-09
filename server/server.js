@@ -16,6 +16,8 @@ const PORT = Number(process.env.PORT || 3000);
 const CRON_SCHEDULE = process.env.CRON_SCHEDULE || '* * * * *';
 const RUN_ONCE = process.env.RUN_ONCE === 'true' || process.argv.includes('--once');
 
+const DAY_BEFORE_NOON_HOUR = Number(process.env.AVISO_DIA_ANTERIOR_MEDIODIA_HORA ?? 12);
+const DAY_BEFORE_NOON_MINUTE = Number(process.env.AVISO_DIA_ANTERIOR_MEDIODIA_MINUTO ?? 0);
 const DAY_BEFORE_HOUR = Number(process.env.ENSAYO_AVISO_DIA_ANTERIOR_HORA ?? 18);
 const DAY_BEFORE_MINUTE = Number(process.env.ENSAYO_AVISO_DIA_ANTERIOR_MINUTO ?? 0);
 const SAME_DAY_HOUR = Number(process.env.ENSAYO_AVISO_MISMO_DIA_HORA ?? 8);
@@ -426,19 +428,27 @@ async function procesarCanciones(now, initializedAtMs) {
 }
 
 
-function momentoAvisoCalendario(fechaEvento, now) {
-  if (!fechaEvento || !fechaEvento.isValid || !now || !now.isValid) return null;
+function momentosAvisoCalendario(fechaEvento, now) {
+  if (!fechaEvento || !fechaEvento.isValid || !now || !now.isValid) return [];
   const afterOrAt = (hour, minute) =>
     now.hour > hour || (now.hour === hour && now.minute >= minute);
+  const momentos = [];
 
   const diaAnterior = fechaEvento.minus({ days: 1 });
-  if (now.hasSame(diaAnterior, 'day') && afterOrAt(DAY_BEFORE_HOUR, DAY_BEFORE_MINUTE)) {
-    return 'dia_anterior';
+  if (now.hasSame(diaAnterior, 'day')) {
+    // Dos recordatorios independientes el día anterior: mediodía y tarde.
+    // Las claves de idempotencia separadas evitan duplicados de cada franja.
+    if (afterOrAt(DAY_BEFORE_NOON_HOUR, DAY_BEFORE_NOON_MINUTE)) {
+      momentos.push('dia_anterior_mediodia');
+    }
+    if (afterOrAt(DAY_BEFORE_HOUR, DAY_BEFORE_MINUTE)) {
+      momentos.push('dia_anterior');
+    }
   }
   if (now.hasSame(fechaEvento, 'day') && afterOrAt(SAME_DAY_HOUR, SAME_DAY_MINUTE)) {
-    return 'mismo_dia';
+    momentos.push('mismo_dia');
   }
-  return null;
+  return momentos;
 }
 
 async function obtenerMesesConHorariosVisibles() {
@@ -473,10 +483,10 @@ async function procesarAsignaciones(now) {
       }, { zone: APP_TIMEZONE }).startOf('day');
       if (!fechaServicio.isValid) continue;
 
-      // Las asignaciones NO avisan al guardarse: solo se recuerda el día anterior
-      // y el mismo día del servicio, a las horas configuradas.
-      const modo = momentoAvisoCalendario(fechaServicio, now);
-      if (!modo) continue;
+      // Las asignaciones NO avisan al guardarse: se recuerdan al mediodía
+      // y por la tarde del día anterior, y también la mañana del servicio.
+      const modos = momentosAvisoCalendario(fechaServicio, now);
+      if (!modos.length) continue;
 
       const equipo = Array.isArray(data.equipo) ? data.equipo : [];
       const ids = [...new Set(equipo.map(miembro => miembro?.id_usuario).filter(Boolean))];
@@ -484,22 +494,30 @@ async function procesarAsignaciones(now) {
 
       const fechaTexto = formatoFecha(fechaServicio);
       const servicio = data.descripcion_servicio || 'el servicio';
-      const esDiaAnterior = modo === 'dia_anterior';
-      const title = esDiaAnterior ? '📅 Mañana tienes asignación' : '📅 Hoy tienes asignación';
-      const body = `${esDiaAnterior ? 'Mañana tienes asignación' : 'Hoy tienes asignación'} para el ${fechaTexto} en ${servicio}.`;
 
-      // Un evento por persona: los destinatarios solo son integrantes asignados y
-      // un fallo con un usuario no impide que los demás reciban su recordatorio.
-      for (const uid of ids) {
-        const destinatarios = await obtenerDestinatarios([uid]);
-        const eventKey = `asignacion_recordatorio|${docSnap.id}|${uid}|${fechaServicio.toISODate()}|${modo}`;
-        const sent = await enviarEventoUnico(eventKey, {
-          title,
-          body,
-          type: esDiaAnterior ? 'asignacion_dia_anterior' : 'asignacion_mismo_dia',
-          extra: { horarioId: docSnap.id, uid, fechaServicio: fechaServicio.toISODate(), momento: modo }
-        }, destinatarios);
-        if (sent) procesadas += 1;
+      // Cada franja y cada persona tiene su propia clave: el aviso del mediodía
+      // no consume ni bloquea el aviso de las 18:00 ni el del mismo día.
+      for (const modo of modos) {
+        const esDiaAnterior = modo !== 'mismo_dia';
+        const title = esDiaAnterior ? '📅 Mañana tienes asignación' : '📅 Hoy tienes asignación';
+        const body = `${esDiaAnterior ? 'Mañana tienes asignación' : 'Hoy tienes asignación'} para el ${fechaTexto} en ${servicio}.`;
+        const tipo = modo === 'dia_anterior_mediodia'
+          ? 'asignacion_dia_anterior_mediodia'
+          : modo === 'dia_anterior'
+            ? 'asignacion_dia_anterior'
+            : 'asignacion_mismo_dia';
+
+        for (const uid of ids) {
+          const destinatarios = await obtenerDestinatarios([uid]);
+          const eventKey = `asignacion_recordatorio|${docSnap.id}|${uid}|${fechaServicio.toISODate()}|${modo}`;
+          const sent = await enviarEventoUnico(eventKey, {
+            title,
+            body,
+            type: tipo,
+            extra: { horarioId: docSnap.id, uid, fechaServicio: fechaServicio.toISODate(), momento: modo }
+          }, destinatarios);
+          if (sent) procesadas += 1;
+        }
       }
     }
   }
@@ -547,8 +565,8 @@ async function procesarEnsayos(now) {
         .filter(Boolean))];
       if (!ids.length) continue;
 
-      const modo = momentoAvisoCalendario(ensayoDt, now);
-      if (!modo) continue;
+      const modos = momentosAvisoCalendario(ensayoDt, now);
+      if (!modos.length) continue;
 
       const infoServicio = parseMesAnio(data.mes_anio);
       const diaServicio = Number(serviceKey);
@@ -557,22 +575,30 @@ async function procesarEnsayos(now) {
         : null;
       const fechaServicioTexto = fechaServicio?.isValid ? formatoFecha(fechaServicio) : `día ${serviceKey}`;
       const fechaEnsayoTexto = formatoFecha(ensayoDt);
-      const esDiaAnterior = modo === 'dia_anterior';
-      const title = esDiaAnterior ? '🎵 Mañana tienes ensayo' : '🎵 Hoy tienes ensayo';
-      const body = `${esDiaAnterior ? 'Mañana tienes ensayo' : 'Hoy tienes ensayo'} para el servicio del ${fechaServicioTexto}. El ensayo es el ${fechaEnsayoTexto} a las ${data.hora_ensayo || 'hora pendiente'}.`;
 
-      // Cada integrante asignado tiene su propia clave de idempotencia. Así, el
-      // éxito de un integrante no bloquea reintentos para otro que haya fallado.
-      for (const uid of ids) {
-        const destinatarios = await obtenerDestinatarios([uid]);
-        const eventKey = `ensayo_recordatorio|${data.mes_anio}|${serviceKey}|${data.dia_ensayo}|${data.hora_ensayo}|${uid}|${modo}`;
-        const sent = await enviarEventoUnico(eventKey, {
-          title,
-          body,
-          type: esDiaAnterior ? 'aviso_ensayo_dia_anterior' : 'aviso_ensayo_mismo_dia',
-          extra: { horarioId: horario.id, ensayoId: docSnap.id, uid, momento: modo }
-        }, destinatarios);
-        if (sent) procesadas += 1;
+      // Cada momento (mediodía, tarde y mismo día) y cada integrante usa una
+      // clave independiente, tanto para asignaciones como para ensayos.
+      for (const modo of modos) {
+        const esDiaAnterior = modo !== 'mismo_dia';
+        const title = esDiaAnterior ? '🎵 Mañana tienes ensayo' : '🎵 Hoy tienes ensayo';
+        const body = `${esDiaAnterior ? 'Mañana tienes ensayo' : 'Hoy tienes ensayo'} para el servicio del ${fechaServicioTexto}. El ensayo es el ${fechaEnsayoTexto} a las ${data.hora_ensayo || 'hora pendiente'}.`;
+        const tipo = modo === 'dia_anterior_mediodia'
+          ? 'aviso_ensayo_dia_anterior_mediodia'
+          : modo === 'dia_anterior'
+            ? 'aviso_ensayo_dia_anterior'
+            : 'aviso_ensayo_mismo_dia';
+
+        for (const uid of ids) {
+          const destinatarios = await obtenerDestinatarios([uid]);
+          const eventKey = `ensayo_recordatorio|${data.mes_anio}|${serviceKey}|${data.dia_ensayo}|${data.hora_ensayo}|${uid}|${modo}`;
+          const sent = await enviarEventoUnico(eventKey, {
+            title,
+            body,
+            type: tipo,
+            extra: { horarioId: horario.id, ensayoId: docSnap.id, uid, momento: modo }
+          }, destinatarios);
+          if (sent) procesadas += 1;
+        }
       }
     }
   }

@@ -311,10 +311,30 @@ async function actualizarUltimaRevision(ref) {
 }
 
 async function enviarEventoUnico(eventKey, notification, destinatarios) {
+  // No consumir el evento si aún no hay destinatarios con tokens activos: la
+  // revisión siguiente debe poder reintentar cuando activen las notificaciones.
+  if (!Array.isArray(destinatarios) || destinatarios.length === 0) {
+    console.warn(`[NOTIFICACIONES] Evento ${notification.type || eventKey} sin destinatarios con push activo; se reintentará.`);
+    return false;
+  }
+
   const claim = await reclamarEvento(eventKey, notification);
   if (!claim) return false;
   try {
-    await enviarNotificacion(destinatarios, notification);
+    const resultado = await enviarNotificacion(destinatarios, notification);
+    // sendEach puede completar sin lanzar excepción aunque todos los tokens fallen.
+    // En ese caso liberamos el evento para que el próximo cron pueda reintentarlo.
+    if (!resultado.successCount) {
+      await liberarEvento(claim);
+      console.warn(`[NOTIFICACIONES] Evento ${notification.type || eventKey} sin entregas exitosas; se reintentará.`);
+      return false;
+    }
+    await claim.set({
+      envios_exitosos: resultado.successCount,
+      envios_fallidos: resultado.failureCount,
+      destinatarios: resultado.destinatarios,
+      enviado_en: FieldValue.serverTimestamp()
+    }, { merge: true });
     return true;
   } catch (error) {
     await liberarEvento(claim);
@@ -405,6 +425,49 @@ async function procesarCanciones(now, initializedAtMs) {
   return procesadas;
 }
 
+
+async function procesarAsignaciones(now, initializedAtMs) {
+  const monthKeys = [numeroMesClave(now), mesSiguienteClave(now)];
+  const snapshots = await Promise.all(monthKeys.map(key =>
+    db.collection('horarios_servicios').where('mes_anio', '==', key).get()
+  ));
+  let procesadas = 0;
+
+  for (const snap of snapshots) {
+    for (const docSnap of snap.docs) {
+      const data = docSnap.data() || {};
+      if (data.actualizado_por_reinicio_disponibilidad === true) continue;
+      const creadoMs = toMillis(data.creado_el);
+      const actualizadoMs = toMillis(data.actualizado_el);
+      const eventoMs = actualizadoMs || creadoMs;
+      if (eventoMs === null || eventoMs <= initializedAtMs) continue;
+
+      const equipo = Array.isArray(data.equipo) ? data.equipo : [];
+      const ids = [...new Set(equipo.map(m => m?.id_usuario).filter(Boolean))];
+      if (!ids.length) continue;
+
+      const info = parseMesAnio(data.mes_anio);
+      const dia = Number(data.dia);
+      const fechaServicio = info && Number.isInteger(dia)
+        ? DateTime.fromObject({ year: info.anio, month: info.mes, day: dia }, { zone: APP_TIMEZONE })
+        : null;
+      const fechaTexto = fechaServicio?.isValid ? formatoFecha(fechaServicio) : `día ${dia}`;
+      const esNueva = creadoMs !== null && (actualizadoMs === null || creadoMs >= actualizadoMs);
+      const eventKey = `asignacion|${docSnap.id}|${eventoMs}`;
+      const destinatarios = await obtenerDestinatarios(ids);
+
+      const sent = await enviarEventoUnico(eventKey, {
+        title: esNueva ? '📅 Nueva asignación' : '📅 Asignación actualizada',
+        body: `${esNueva ? 'Tienes una nueva asignación' : 'Se actualizó tu asignación'} para ${data.descripcion_servicio || 'el servicio'} — ${fechaTexto}.`,
+        type: esNueva ? 'nueva_asignacion' : 'asignacion_actualizada',
+        extra: { horarioId: docSnap.id }
+      }, destinatarios);
+      if (sent) procesadas += 1;
+    }
+  }
+  return procesadas;
+}
+
 async function procesarEnsayos(now, initializedAtMs) {
   const monthKeys = [numeroMesClave(now), mesSiguienteClave(now)];
   const snapshots = await Promise.all(monthKeys.map(key => db.collection('ensayos_servicios').where('mes_anio', '==', key).get()));
@@ -439,9 +502,12 @@ async function procesarEnsayos(now, initializedAtMs) {
 
       if (!dueDayBefore && !dueSameDay) continue;
 
-      // Nunca se emite un recordatorio cuya fecha calculada quede antes del
-      // momento en que el servidor fue inicializado.
-      const eventoReferencia = dueDayBefore ? fechaAvisoDiaAnterior : ensayoDt;
+      // La línea base debe compararse con la hora programada del aviso, no con
+      // la hora del ensayo. Si un ensayo es por la mañana, comparar ensayoDt
+      // podría suprimir indebidamente el recordatorio de las 08:00.
+      const eventoReferencia = dueDayBefore
+        ? fechaAvisoDiaAnterior.set({ hour: DAY_BEFORE_HOUR, minute: DAY_BEFORE_MINUTE, second: 0, millisecond: 0 })
+        : ensayoDt.set({ hour: SAME_DAY_HOUR, minute: SAME_DAY_MINUTE, second: 0, millisecond: 0 });
       if (eventoReferencia.toMillis() <= initializedAtMs) continue;
 
       const modo = dueDayBefore ? 'dia_anterior' : 'mismo_dia';
@@ -500,17 +566,32 @@ async function ejecutarRevision() {
     const estadoData = estadoSnap.data() || {};
     const initializedAtMs = toMillis(estadoData.inicializado_en) || 0;
 
-    const [suplencias, canciones, ensayos, aperturaMes] = await Promise.all([
+    // Esperar a que terminen todos los procesadores aun cuando uno falle;
+    // Promise.all rechaza en el primer error y podría cortar otros envíos al
+    // salir del proceso puntual de GitHub Actions.
+    const resultados = await Promise.allSettled([
       procesarSuplencias(inicio, initializedAtMs),
       procesarCanciones(inicio, initializedAtMs),
+      procesarAsignaciones(inicio, initializedAtMs),
       procesarEnsayos(inicio, initializedAtMs),
       procesarAperturaMesSiguiente(inicio, initializedAtMs)
     ]);
+    const errores = resultados.filter(resultado => resultado.status === 'rejected');
+    if (errores.length) {
+      throw new AggregateError(
+        errores.map(resultado => resultado.reason),
+        `${errores.length} proceso(s) de notificación fallaron.`
+      );
+    }
+    const [suplencias, canciones, asignaciones, ensayos, aperturaMes] = resultados.map(resultado => resultado.value);
 
     await actualizarUltimaRevision(estado.ref);
-    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} ensayos=${ensayos} aperturaMes=${aperturaMes}`);
+    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} asignaciones=${asignaciones} ensayos=${ensayos} aperturaMes=${aperturaMes}`);
   } catch (error) {
     console.error('[NOTIFICACIONES] Error durante la revisión:', error);
+    // En GitHub Actions --once debe devolver un código distinto de cero si
+    // Firestore/FCM fallan; de otro modo la ejecución aparece como exitosa.
+    if (RUN_ONCE) throw error;
   } finally {
     cronEnCurso = false;
   }

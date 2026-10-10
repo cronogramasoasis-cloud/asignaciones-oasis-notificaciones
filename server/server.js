@@ -71,7 +71,7 @@ app.get('/health', (_req, res) => {
     now: DateTime.now().setZone(APP_TIMEZONE).toISO()
   });
 });
-app.get('/', (_req, res) => res.status(200).send('Asignaciones Oasis — servidor de notificaciones activo.'));
+app.get('/', (_req, res) => res.status(200).send('A.S.A.F. — servidor de notificaciones activo.'));
 
 let server = null;
 if (!RUN_ONCE) {
@@ -508,21 +508,6 @@ async function procesarAsignaciones(now) {
             : 'asignacion_mismo_dia';
 
         for (const uid of ids) {
-          // Releer el horario justo antes de enviar: la consulta inicial puede
-          // quedar desactualizada si alguien fue retirado del equipo durante
-          // esta misma revisión.
-          const horarioActual = await docSnap.ref.get();
-          if (!horarioActual.exists) continue;
-          const datosHorarioActual = horarioActual.data() || {};
-          const equipoActual = Array.isArray(datosHorarioActual.equipo)
-            ? datosHorarioActual.equipo
-            : [];
-          const sigueAsignado = equipoActual.some(miembro => miembro?.id_usuario === uid);
-          if (!sigueAsignado) {
-            console.log(`[NOTIFICACIONES] Recordatorio omitido: uid=${uid} ya no figura en equipo del horario ${docSnap.id}.`);
-            continue;
-          }
-
           const destinatarios = await obtenerDestinatarios([uid]);
           const eventKey = `asignacion_recordatorio|${docSnap.id}|${uid}|${fechaServicio.toISODate()}|${modo}`;
           const sent = await enviarEventoUnico(eventKey, {
@@ -533,6 +518,47 @@ async function procesarAsignaciones(now) {
           }, destinatarios);
           if (sent) procesadas += 1;
         }
+      }
+    }
+  }
+  return procesadas;
+}
+
+
+async function procesarAsignacionesOracion(now) {
+  const monthKeys = [numeroMesClave(now), mesSiguienteClave(now)];
+  const snapshots = await Promise.all(monthKeys.map(key => db.collection('asignaciones_oracion').where('mes_anio', '==', key).get()));
+  let procesadas = 0;
+
+  for (const snap of snapshots) {
+    for (const docSnap of snap.docs) {
+      const data = docSnap.data() || {};
+      const uid = String(data.id_usuario || '').trim();
+      const fechaTextoISO = String(data.fecha || '').trim();
+      if (!uid || !/^\d{4}-\d{2}-\d{2}$/.test(fechaTextoISO)) continue;
+      const fechaOracion = DateTime.fromISO(fechaTextoISO, { zone: APP_TIMEZONE }).startOf('day');
+      if (!fechaOracion.isValid || fechaOracion < now.startOf('day') || fechaOracion > now.plus({ months: 1 }).endOf('month')) continue;
+
+      const modos = momentosAvisoCalendario(fechaOracion, now);
+      if (!modos.length) continue;
+      const fechaLegible = formatoFecha(fechaOracion);
+
+      for (const modo of modos) {
+        const esDiaAnterior = modo !== 'mismo_dia';
+        const tipo = modo === 'dia_anterior_mediodia'
+          ? 'oracion_dia_anterior_mediodia'
+          : modo === 'dia_anterior'
+            ? 'oracion_dia_anterior'
+            : 'oracion_mismo_dia';
+        const destinatarios = await obtenerDestinatarios([uid]);
+        const eventKey = `oracion_recordatorio|${docSnap.id}|${uid}|${fechaTextoISO}|${modo}`;
+        const sent = await enviarEventoUnico(eventKey, {
+          title: esDiaAnterior ? '🎙️ Mañana te corresponde la oración' : '🎙️ Hoy te corresponde la oración',
+          body: `${esDiaAnterior ? 'Mañana' : 'Hoy'} te corresponde enviar el audio de oración al grupo (${fechaLegible}).`,
+          type: tipo,
+          extra: { oracionId: docSnap.id, uid, fecha: fechaTextoISO, momento: modo }
+        }, destinatarios);
+        if (sent) procesadas += 1;
       }
     }
   }
@@ -703,6 +729,7 @@ async function ejecutarRevision() {
       procesarSuplencias(inicio, initializedAtMs),
       procesarCanciones(inicio, initializedAtMs),
       procesarAsignaciones(inicio),
+      procesarAsignacionesOracion(inicio),
       procesarEnsayos(inicio),
       procesarAperturaMesSiguiente(inicio, initializedAtMs),
       procesarPublicacionHorarios()
@@ -714,10 +741,10 @@ async function ejecutarRevision() {
         `${errores.length} proceso(s) de notificación fallaron.`
       );
     }
-    const [suplencias, canciones, asignaciones, ensayos, aperturaMes, publicacionHorarios] = resultados.map(resultado => resultado.value);
+    const [suplencias, canciones, asignaciones, oraciones, ensayos, aperturaMes, publicacionHorarios] = resultados.map(resultado => resultado.value);
 
     await actualizarUltimaRevision(estado.ref);
-    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} asignaciones=${asignaciones} ensayos=${ensayos} aperturaMes=${aperturaMes} publicacionHorarios=${publicacionHorarios}`);
+    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} asignaciones=${asignaciones} oraciones=${oraciones} ensayos=${ensayos} aperturaMes=${aperturaMes} publicacionHorarios=${publicacionHorarios}`);
   } catch (error) {
     console.error('[NOTIFICACIONES] Error durante la revisión:', error);
     // En GitHub Actions --once debe devolver un código distinto de cero si

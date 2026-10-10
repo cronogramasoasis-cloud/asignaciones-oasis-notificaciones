@@ -1,21 +1,26 @@
-# Servidor de notificaciones de Asignaciones Oasis
+# Backend de notificaciones de A.S.A.F.
 
-Este backend es independiente de la interfaz que se publica en Netlify. Ejecuta un proceso Node.js con `node-cron`, consulta Firestore y envía notificaciones web mediante Firebase Cloud Messaging (FCM).
+Este backend es independiente de la web publicada en Netlify. Node.js consulta Firestore y envía notificaciones web mediante Firebase Cloud Messaging (FCM). En el despliegue incluido, GitHub Actions ejecuta una revisión automática cada cinco minutos, así que no hace falta mantener un servidor encendido 24/7.
 
 ## Eventos automatizados
 
-1. Solicitud de suplencia: solo se notifica a usuarios con `es_operador: true` y notificaciones push activadas.
-2. Aviso de ensayo: se notifica al equipo asignado. El aviso del día anterior sale a la hora configurada en `ENSAYO_AVISO_DIA_ANTERIOR_HORA/MINUTO`; el aviso del mismo día sale a la hora configurada en `ENSAYO_AVISO_MISMO_DIA_HORA/MINUTO`.
-3. Canciones actualizadas por director/operador: se notifica al equipo del servicio, excluyendo a quien hizo el cambio.
-4. Apertura del mes siguiente: se notifica a todos los usuarios con notificaciones push activadas cuando el operador abre la disponibilidad del mes siguiente.
+1. **Solicitudes de suplencia:** avisa a usuarios con `es_operador: true` y tokens push activos.
+2. **Asignaciones musicales:** recordatorios individuales el día anterior a las 12:00 y 18:00, y el mismo día a las 08:00. Solo se procesan cuando el mes de horarios está publicado.
+3. **Asignaciones de oración por audio:** recordatorios al integrante asignado el día anterior a las 12:00 y 18:00, y el mismo día a las 08:00. Son independientes de las disponibilidades y de la publicación del horario musical.
+4. **Ensayos:** recordatorios al equipo del servicio asociado, en las horas configuradas; solo se procesan cuando el mes de horarios está publicado. Si el ensayo no puede asociarse inequívocamente con un servicio, no se envía a un equipo arbitrario.
+5. **Canciones actualizadas:** aviso al equipo del servicio, excluyendo a quien hizo el cambio.
+6. **Apertura del mes siguiente:** aviso a usuarios con push activo cuando el operador abre disponibilidad para el mes siguiente.
+7. **Publicación de horarios:** aviso general a usuarios con token FCM activo cuando el operador hace visible un mes. Las asignaciones musicales y los ensayos dejan de recordarse mientras ese mes esté oculto; las asignaciones de oración se mantienen independientes.
+
+Cada evento utiliza una clave de idempotencia para que una revisión repetida no produzca avisos duplicados. Los envíos se procesan individualmente por destinatario/momento cuando corresponde, los tokens inválidos se limpian y los eventos sin entregas exitosas pueden reintentarse.
 
 ## Requisitos
 
-- Node.js 22 o superior.
-- Una cuenta de servicio de Firebase con acceso al proyecto `oasis-asignaciones`.
-- La aplicación web ya debe guardar los tokens FCM en `usuarios.fcm_tokens`. El frontend entregado en la carpeta raíz ya realiza ese registro.
+- Node.js 22 o superior; el workflow usa Node.js 24.
+- Una cuenta de servicio de Firebase Admin SDK para el proyecto `oasis-asignaciones`.
+- Tokens FCM almacenados en `usuarios/{uid}.fcm_tokens`, con `fcm_push_enabled` no desactivado y permiso de notificaciones concedido en el dispositivo.
 
-## Instalación local
+## Prueba local
 
 ```bash
 cd server
@@ -23,28 +28,14 @@ npm install
 cp .env.example .env
 ```
 
-Descarga una clave privada JSON de la cuenta de servicio desde Firebase Console y guárdala como `serviceAccountKey.json` dentro de `server/`. El `.gitignore` ya evita que se suba al repositorio.
-
-Luego ejecuta:
+Guarda una credencial privada de Firebase de forma segura y define `FIREBASE_SERVICE_ACCOUNT_JSON` o `GOOGLE_APPLICATION_CREDENTIALS`. No subas la clave privada a GitHub ni a Netlify.
 
 ```bash
 npm start
 ```
 
-La comprobación de salud queda disponible en `/health`.
+Una prueba puntual usa `node server.js --once`. La primera ejecución crea `configuracion/notificaciones_backend` como línea base y omite eventos antiguos para evitar una ráfaga inicial de avisos.
 
-## Credenciales en hosting
+## GitHub Actions
 
-En un servidor como Render/Railway/Cloud Run es preferible guardar la credencial en variables seguras. Se puede usar `GOOGLE_APPLICATION_CREDENTIALS` apuntando a un archivo montado, o `FIREBASE_SERVICE_ACCOUNT_JSON` con el JSON completo de la cuenta de servicio.
-
-Nunca publiques `serviceAccountKey.json`, `GOOGLE_APPLICATION_CREDENTIALS`, `FIREBASE_SERVICE_ACCOUNT_JSON` ni la clave privada en GitHub o dentro de la carpeta que subes a Netlify.
-
-## Primera ejecución
-
-La primera ejecución crea `configuracion/notificaciones_backend` con una línea base. Así, el backend no manda de golpe notificaciones antiguas que ya existían antes de instalarlo. A partir de esa línea base, cada evento nuevo se procesa automáticamente.
-
-El backend guarda una huella de cada evento en `notificaciones_enviadas`, por lo que una misma solicitud/actualización/recordatorio no se vuelve a mandar en cada minuto del cron.
-
-## Importante sobre Netlify
-
-La carpeta raíz se sigue publicando como sitio estático en Netlify. El servidor de esta carpeta `server/` debe ejecutarse en un servicio que mantenga Node.js activo o que ejecute cron de forma fiable. No subas las credenciales privadas al sitio estático.
+Configura el secreto `FIREBASE_SERVICE_ACCOUNT_JSON` en **Settings → Secrets and variables → Actions**. El workflow de la raíz ejecuta `node server.js --once` cada cinco minutos. Ante un fallo de Firestore/FCM, la ejecución aparece como fallida, en lugar de ocultar el error.

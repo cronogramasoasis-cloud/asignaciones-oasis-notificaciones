@@ -208,9 +208,9 @@ async function obtenerDestinatarios(userIds, excluirUid = '') {
   docs.forEach(snapshot => {
     if (!snapshot.exists) return;
     const data = snapshot.data() || {};
-    if (data.fcm_push_enabled === false) return;
-    const tokens = Array.isArray(data.fcm_tokens) ? data.fcm_tokens.filter(Boolean) : [];
-    if (!tokens.length) return;
+    const tokens = data.fcm_push_enabled === false
+      ? []
+      : (Array.isArray(data.fcm_tokens) ? data.fcm_tokens.filter(Boolean) : []);
     destinatarios.push({
       uid: snapshot.id,
       nombre: data.nombre_completo || 'Integrante',
@@ -227,9 +227,9 @@ async function obtenerTodosDestinatarios(filtro) {
   snap.forEach(snapshot => {
     const data = snapshot.data() || {};
     if (filtro && !filtro(data)) return;
-    if (data.fcm_push_enabled === false) return;
-    const tokens = Array.isArray(data.fcm_tokens) ? data.fcm_tokens.filter(Boolean) : [];
-    if (!tokens.length) return;
+    const tokens = data.fcm_push_enabled === false
+      ? []
+      : (Array.isArray(data.fcm_tokens) ? data.fcm_tokens.filter(Boolean) : []);
     destinatarios.push({
       uid: snapshot.id,
       nombre: data.nombre_completo || 'Integrante',
@@ -239,8 +239,45 @@ async function obtenerTodosDestinatarios(filtro) {
   return destinatarios;
 }
 
-async function enviarNotificacion(destinatarios, { title, body, type, extra = {} }) {
-  if (!destinatarios.length) return { successCount: 0, failureCount: 0, destinatarios: 0 };
+async function registrarNotificacionEnCentro(uid, eventKey, notification) {
+  if (!uid || !eventKey) return false;
+  const ref = db.collection('usuarios').doc(uid);
+  const id = hashEventKey(`${eventKey}|centro|${uid}`);
+  const item = {
+    id,
+    titulo: String(notification.title || 'A.S.A.F.'),
+    cuerpo: String(notification.body || 'Tienes una nueva actualización.'),
+    tipo: String(notification.type || 'asaf'),
+    fecha_creacion: DateTime.now().setZone(APP_TIMEZONE).toMillis(),
+    datos: Object.fromEntries(Object.entries(notification.extra || {}).map(([k, v]) => [k, String(v)]))
+  };
+
+  return db.runTransaction(async transaction => {
+    const snap = await transaction.get(ref);
+    if (!snap.exists) return false;
+    const data = snap.data() || {};
+    const historial = Array.isArray(data.notificaciones_app) ? data.notificaciones_app : [];
+    if (historial.some(aviso => aviso && aviso.id === id)) return false;
+    // Limitar el perfil a los 100 avisos más recientes para evitar que el
+    // documento de usuario crezca sin límite y conservar la biblioteca/perfil existente.
+    transaction.update(ref, { notificaciones_app: [...historial, item].slice(-100) });
+    return true;
+  });
+}
+
+async function enviarNotificacion(destinatarios, { title, body, type, extra = {} }, eventKey = '') {
+  if (!destinatarios.length) return { successCount: 0, failureCount: 0, destinatarios: 0, tokensDisponibles: 0 };
+
+  // El historial se escribe en la misma cuenta de cada destinatario del push,
+  // incluso si la notificación llega a varios de sus dispositivos.
+  const guardados = await Promise.allSettled(destinatarios.map(user =>
+    registrarNotificacionEnCentro(user.uid, eventKey, { title, body, type, extra })
+  ));
+  guardados.forEach((resultado, index) => {
+    if (resultado.status === 'rejected') {
+      console.warn(`[NOTIFICACIONES] No se guardó el aviso en el centro de ${destinatarios[index]?.uid}: ${resultado.reason?.message || resultado.reason}`);
+    }
+  });
 
   const mensajes = [];
   for (const user of destinatarios) {
@@ -257,6 +294,7 @@ async function enviarNotificacion(destinatarios, { title, body, type, extra = {}
       });
     }
   }
+  if (!mensajes.length) return { successCount: 0, failureCount: 0, destinatarios: destinatarios.length, tokensDisponibles: 0 };
 
   let successCount = 0;
   let failureCount = 0;
@@ -290,7 +328,7 @@ async function enviarNotificacion(destinatarios, { title, body, type, extra = {}
   }
 
   await quitarTokensInvalidos(invalidByUser);
-  return { successCount, failureCount, destinatarios: destinatarios.length };
+  return { successCount, failureCount, destinatarios: destinatarios.length, tokensDisponibles: mensajes.length };
 }
 
 async function obtenerEstadoBackend() {
@@ -313,28 +351,40 @@ async function actualizarUltimaRevision(ref) {
 }
 
 async function enviarEventoUnico(eventKey, notification, destinatarios) {
-  // No consumir el evento si aún no hay destinatarios con tokens activos: la
-  // revisión siguiente debe poder reintentar cuando activen las notificaciones.
+  // El centro de notificaciones funciona aunque no haya tokens push. Si no hay
+  // usuarios objetivo, no se crea ni se consume el evento.
   if (!Array.isArray(destinatarios) || destinatarios.length === 0) {
-    console.warn(`[NOTIFICACIONES] Evento ${notification.type || eventKey} sin destinatarios con push activo; se reintentará.`);
+    console.warn(`[NOTIFICACIONES] Evento ${notification.type || eventKey} sin usuarios destinatarios.`);
     return false;
   }
 
   const claim = await reclamarEvento(eventKey, notification);
   if (!claim) return false;
   try {
-    const resultado = await enviarNotificacion(destinatarios, notification);
+    const resultado = await enviarNotificacion(destinatarios, notification, eventKey);
     // sendEach puede completar sin lanzar excepción aunque todos los tokens fallen.
     // En ese caso liberamos el evento para que el próximo cron pueda reintentarlo.
     if (!resultado.successCount) {
+      if (!resultado.tokensDisponibles) {
+        await claim.set({
+          envios_exitosos: 0,
+          envios_fallidos: 0,
+          destinatarios: resultado.destinatarios,
+          historial_guardado: true,
+          solo_centro: true,
+          enviado_en: FieldValue.serverTimestamp()
+        }, { merge: true });
+        return true;
+      }
       await liberarEvento(claim);
-      console.warn(`[NOTIFICACIONES] Evento ${notification.type || eventKey} sin entregas exitosas; se reintentará.`);
+      console.warn(`[NOTIFICACIONES] Evento ${notification.type || eventKey} sin entregas push exitosas; se reintentará.`);
       return false;
     }
     await claim.set({
       envios_exitosos: resultado.successCount,
       envios_fallidos: resultado.failureCount,
       destinatarios: resultado.destinatarios,
+      historial_guardado: true,
       enviado_en: FieldValue.serverTimestamp()
     }, { merge: true });
     return true;
@@ -687,13 +737,19 @@ async function procesarAperturaMesSiguiente(now, initializedAtMs) {
   const snap = await ref.get();
   if (!snap.exists) return 0;
   const data = snap.data() || {};
+  const nextMonth = now.plus({ months: 1 });
+  const nextMonthKey = numeroMesClave(nextMonth);
+  const plazoProgramado = data.plazos_disponibilidad && data.plazos_disponibilidad[nextMonthKey];
+  const inicioPlazo = String(plazoProgramado?.inicio || '');
+  const limitePlazo = String(plazoProgramado?.limite || '');
+  if (/^\d{4}-\d{2}-\d{2}$/.test(inicioPlazo)
+      && /^\d{4}-\d{2}-\d{2}$/.test(limitePlazo)
+      && inicioPlazo <= limitePlazo) return 0;
   if (!data.siguiente_mes_abierto) return 0;
 
   const openedMs = toMillis(data.siguiente_mes_abierto_en);
   if (openedMs === null || openedMs <= initializedAtMs) return 0;
 
-  const nextMonth = now.plus({ months: 1 });
-  const nextMonthKey = numeroMesClave(nextMonth);
   const eventKey = `disponibilidad_mes_siguiente|${nextMonthKey}|${openedMs}`;
   const destinatarios = await obtenerTodosDestinatarios();
   const sent = await enviarEventoUnico(eventKey, {
@@ -703,6 +759,83 @@ async function procesarAperturaMesSiguiente(now, initializedAtMs) {
     extra: { mes_anio: nextMonthKey }
   }, destinatarios);
   return sent ? 1 : 0;
+}
+
+async function procesarAvisosPlazoDisponibilidad(now) {
+  const snap = await db.collection('configuracion').doc('general').get();
+  if (!snap.exists) return 0;
+  const plazos = snap.data()?.plazos_disponibilidad;
+  if (!plazos || typeof plazos !== 'object') return 0;
+
+  const hoy = now.toISODate();
+  let procesadas = 0;
+  for (const [mesClave, plazo] of Object.entries(plazos)) {
+    const inicioTexto = String(plazo?.inicio || '');
+    const limiteTexto = String(plazo?.limite || '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(inicioTexto)
+        || !/^\d{4}-\d{2}-\d{2}$/.test(limiteTexto)
+        || inicioTexto > limiteTexto) continue;
+
+    const inicio = DateTime.fromISO(inicioTexto, { zone: APP_TIMEZONE });
+    const limite = DateTime.fromISO(limiteTexto, { zone: APP_TIMEZONE });
+    const infoMes = parseMesAnio(mesClave);
+    if (!inicio.isValid || !limite.isValid || !infoMes) continue;
+    const nombreMes = DateTime.fromObject({ year: infoMes.anio, month: infoMes.mes, day: 1 }, { zone: APP_TIMEZONE })
+      .setLocale('es').toFormat("LLLL 'de' yyyy");
+    const fechaLimiteBonita = limite.setLocale('es').toFormat("d 'de' LLLL");
+
+    const recordatorios = [
+      {
+        momento: 'apertura', fecha: inicioTexto,
+        title: '🗓️ Disponibilidades abiertas',
+        body: `Ya se abrió el plazo para llenar tu disponibilidad de ${nombreMes}. Puedes enviarla desde el ${inicio.setLocale('es').toFormat("d 'de' LLLL")} hasta el ${fechaLimiteBonita}.`,
+        type: 'disponibilidad_plazo_abierto'
+      },
+      {
+        momento: 'dos_dias', fecha: limite.minus({ days: 2 }).toISODate(),
+        title: '⏳ Quedan 2 días para llenar la disponibilidad',
+        body: `Quedan 2 días para llenar tu disponibilidad de ${nombreMes}. El plazo cierra el ${fechaLimiteBonita}.`,
+        type: 'disponibilidad_plazo_dos_dias'
+      },
+      {
+        momento: 'un_dia', fecha: limite.minus({ days: 1 }).toISODate(),
+        title: '⚠️ Solo queda 1 día',
+        body: `Solo queda 1 día para llenar tu disponibilidad de ${nombreMes}. Recuerda enviarla antes de que termine el día ${fechaLimiteBonita}.`,
+        type: 'disponibilidad_plazo_un_dia'
+      },
+      {
+        momento: 'cierre_hoy', fecha: limiteTexto,
+        title: '🔔 Hoy cierran las disponibilidades',
+        body: `Hoy cierra el plazo para llenar tu disponibilidad de ${nombreMes}. Envíala hoy antes de que termine el día.`,
+        type: 'disponibilidad_plazo_cierre_hoy'
+      },
+      {
+        momento: 'cerrado', fecha: limite.plus({ days: 1 }).toISODate(),
+        title: '⛔ Plazo de disponibilidad cerrado',
+        body: `El plazo para llenar la disponibilidad de ${nombreMes} cerró el ${fechaLimiteBonita}. Ya no se pueden enviar cambios.`,
+        type: 'disponibilidad_plazo_cerrado'
+      }
+    ];
+
+    for (const aviso of recordatorios) {
+      // Envío exacto en el día configurado para evitar recordatorios históricos.
+      // El inicio se anuncia si el cron vuelve a ejecutarse durante la ventana,
+      // aunque el operador haya guardado las fechas después del día de apertura.
+      const esAperturaDentroDelPlazo = aviso.momento === 'apertura' && hoy >= inicioTexto && hoy <= limiteTexto;
+      if (aviso.momento === 'apertura' ? !esAperturaDentroDelPlazo : hoy !== aviso.fecha) continue;
+
+      const eventKey = `disponibilidad_plazo|${mesClave}|${aviso.momento}|${inicioTexto}|${limiteTexto}`;
+      const destinatarios = await obtenerTodosDestinatarios();
+      const sent = await enviarEventoUnico(eventKey, {
+        title: aviso.title,
+        body: aviso.body,
+        type: aviso.type,
+        extra: { mes_anio: mesClave, fecha_inicio: inicioTexto, fecha_limite: limiteTexto }
+      }, destinatarios);
+      if (sent) procesadas += 1;
+    }
+  }
+  return procesadas;
 }
 
 async function ejecutarRevision() {
@@ -732,7 +865,8 @@ async function ejecutarRevision() {
       procesarAsignacionesOracion(inicio),
       procesarEnsayos(inicio),
       procesarAperturaMesSiguiente(inicio, initializedAtMs),
-      procesarPublicacionHorarios()
+      procesarPublicacionHorarios(),
+      procesarAvisosPlazoDisponibilidad(inicio)
     ]);
     const errores = resultados.filter(resultado => resultado.status === 'rejected');
     if (errores.length) {
@@ -741,10 +875,10 @@ async function ejecutarRevision() {
         `${errores.length} proceso(s) de notificación fallaron.`
       );
     }
-    const [suplencias, canciones, asignaciones, oraciones, ensayos, aperturaMes, publicacionHorarios] = resultados.map(resultado => resultado.value);
+    const [suplencias, canciones, asignaciones, oraciones, ensayos, aperturaMes, publicacionHorarios, plazosDisponibilidad] = resultados.map(resultado => resultado.value);
 
     await actualizarUltimaRevision(estado.ref);
-    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} asignaciones=${asignaciones} oraciones=${oraciones} ensayos=${ensayos} aperturaMes=${aperturaMes} publicacionHorarios=${publicacionHorarios}`);
+    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} asignaciones=${asignaciones} oraciones=${oraciones} ensayos=${ensayos} aperturaMes=${aperturaMes} publicacionHorarios=${publicacionHorarios} avisosPlazo=${plazosDisponibilidad}`);
   } catch (error) {
     console.error('[NOTIFICACIONES] Error durante la revisión:', error);
     // En GitHub Actions --once debe devolver un código distinto de cero si

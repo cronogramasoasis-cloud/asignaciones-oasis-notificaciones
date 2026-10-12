@@ -838,6 +838,110 @@ async function procesarAvisosPlazoDisponibilidad(now) {
   return procesadas;
 }
 
+async function procesarLlamadosChatPendientes() {
+  const solicitudes = await db.collection('solicitudes_llamado_chat')
+    .where('estado', '==', 'pendiente')
+    .limit(25)
+    .get();
+  let procesadas = 0;
+
+  for (const solicitudSnap of solicitudes.docs) {
+    const solicitudRef = solicitudSnap.ref;
+    // Reclamo atómico: evita que dos ejecuciones procesen la misma llamada.
+    const reclamada = await db.runTransaction(async transaction => {
+      const actual = await transaction.get(solicitudRef);
+      if (!actual.exists || actual.data()?.estado !== 'pendiente') return false;
+      transaction.update(solicitudRef, {
+        estado: 'procesando',
+        procesado_inicio: FieldValue.serverTimestamp()
+      });
+      return true;
+    });
+    if (!reclamada) continue;
+
+    try {
+      const solicitud = solicitudSnap.data() || {};
+      const horarioId = String(solicitud.horario_id || '').trim();
+      const callerUid = String(solicitud.caller_uid || '').trim();
+      if (!horarioId || !callerUid) {
+        await solicitudRef.update({ estado: 'rechazado', error: 'Solicitud incompleta.', procesado_fin: FieldValue.serverTimestamp() });
+        procesadas += 1;
+        continue;
+      }
+
+      const [horarioSnap, callerSnap] = await Promise.all([
+        db.collection('horarios_servicios').doc(horarioId).get(),
+        db.collection('usuarios').doc(callerUid).get()
+      ]);
+      if (!horarioSnap.exists || !callerSnap.exists) {
+        await solicitudRef.update({ estado: 'rechazado', error: 'No se encontró el horario o la cuenta solicitante.', procesado_fin: FieldValue.serverTimestamp() });
+        procesadas += 1;
+        continue;
+      }
+      const horario = horarioSnap.data() || {};
+      const participantes = [...new Set((Array.isArray(horario.equipo) ? horario.equipo : [])
+        .map(miembro => String(miembro?.id_usuario || miembro?.uid || ''))
+        .filter(Boolean))];
+      // No confiar en la lista de destinatarios enviada por el navegador: se lee el equipo actual desde Firestore.
+      if (!participantes.includes(callerUid)) {
+        await solicitudRef.update({ estado: 'rechazado', error: 'La persona solicitante no pertenece al equipo de este servicio.', procesado_fin: FieldValue.serverTimestamp() });
+        procesadas += 1;
+        continue;
+      }
+      const destinatariosIds = participantes.filter(uid => uid !== callerUid);
+      if (!destinatariosIds.length) {
+        await solicitudRef.update({ estado: 'sin_destinatarios', destinatarios: 0, procesado_fin: FieldValue.serverTimestamp() });
+        procesadas += 1;
+        continue;
+      }
+
+      const destinatarios = await obtenerDestinatarios(destinatariosIds);
+      const callerData = callerSnap.data() || {};
+      const callerName = String(callerData.nombre_completo || 'Un integrante').slice(0, 100);
+      const descripcion = String(horario.descripcion_servicio || 'servicio').slice(0, 150);
+      const fechaDia = Number(horario.dia);
+      const fechaMes = parseMesAnio(horario.mes_anio);
+      let fechaTexto = '';
+      if (fechaMes && Number.isInteger(fechaDia)) {
+        const fecha = DateTime.fromObject({ year: fechaMes.anio, month: fechaMes.mes, day: fechaDia }, { zone: APP_TIMEZONE });
+        if (fecha.isValid) fechaTexto = ` del ${fecha.setLocale('es').toFormat("cccc d 'de' LLLL")}`;
+      }
+      const notificacion = {
+        title: `🔔 ${callerName} está llamando al equipo`,
+        body: `Aviso para los participantes de ${descripcion}${fechaTexto}. Abre A.S.A.F. para revisar el chat del servicio.`,
+        type: 'chat_llamado_equipo',
+        extra: { horarioId, solicitudLlamadoId: solicitudSnap.id }
+      };
+
+      const enviado = await enviarEventoUnico(`chat_llamado|${solicitudSnap.id}`, notificacion, destinatarios);
+      if (enviado) {
+        await solicitudRef.update({
+          estado: 'enviado',
+          destinatarios: destinatarios.length,
+          completado_en: FieldValue.serverTimestamp()
+        });
+      } else {
+        await solicitudRef.update({
+          estado: 'fallido',
+          destinatarios: destinatarios.length,
+          error: destinatarios.length ? 'El envío no pudo confirmarse.' : 'No hay otros participantes con perfil disponible.',
+          completado_en: FieldValue.serverTimestamp()
+        });
+      }
+      procesadas += 1;
+    } catch (error) {
+      console.error(`[NOTIFICACIONES] Falló llamado de chat ${solicitudSnap.id}:`, error?.message || error);
+      await solicitudRef.update({
+        estado: 'fallido',
+        error: String(error?.message || 'Error al enviar el llamado.').slice(0, 300),
+        completado_en: FieldValue.serverTimestamp()
+      }).catch(updateError => console.error('[NOTIFICACIONES] No se pudo marcar la solicitud fallida:', updateError?.message || updateError));
+      procesadas += 1;
+    }
+  }
+  return procesadas;
+}
+
 async function ejecutarRevision() {
   if (cronEnCurso) return;
   cronEnCurso = true;
@@ -847,6 +951,7 @@ async function ejecutarRevision() {
     const estado = await obtenerEstadoBackend();
     if (!estado.inicializado) {
       console.log('[NOTIFICACIONES] Primera ejecución: se creó la línea base. No se enviarán eventos antiguos.');
+      await procesarLlamadosChatPendientes();
       await actualizarUltimaRevision(estado.ref);
       return;
     }
@@ -866,7 +971,8 @@ async function ejecutarRevision() {
       procesarEnsayos(inicio),
       procesarAperturaMesSiguiente(inicio, initializedAtMs),
       procesarPublicacionHorarios(),
-      procesarAvisosPlazoDisponibilidad(inicio)
+      procesarAvisosPlazoDisponibilidad(inicio),
+      procesarLlamadosChatPendientes()
     ]);
     const errores = resultados.filter(resultado => resultado.status === 'rejected');
     if (errores.length) {
@@ -875,10 +981,10 @@ async function ejecutarRevision() {
         `${errores.length} proceso(s) de notificación fallaron.`
       );
     }
-    const [suplencias, canciones, asignaciones, oraciones, ensayos, aperturaMes, publicacionHorarios, plazosDisponibilidad] = resultados.map(resultado => resultado.value);
+    const [suplencias, canciones, asignaciones, oraciones, ensayos, aperturaMes, publicacionHorarios, plazosDisponibilidad, llamadosChat] = resultados.map(resultado => resultado.value);
 
     await actualizarUltimaRevision(estado.ref);
-    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} asignaciones=${asignaciones} oraciones=${oraciones} ensayos=${ensayos} aperturaMes=${aperturaMes} publicacionHorarios=${publicacionHorarios} avisosPlazo=${plazosDisponibilidad}`);
+    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} asignaciones=${asignaciones} oraciones=${oraciones} ensayos=${ensayos} aperturaMes=${aperturaMes} publicacionHorarios=${publicacionHorarios} avisosPlazo=${plazosDisponibilidad} llamadosChat=${llamadosChat}`);
   } catch (error) {
     console.error('[NOTIFICACIONES] Error durante la revisión:', error);
     // En GitHub Actions --once debe devolver un código distinto de cero si

@@ -152,19 +152,58 @@ function hashEventKey(eventKey) {
   return crypto.createHash('sha256').update(eventKey).digest('hex');
 }
 
+function eventoCompletado(data) {
+  return data?.completo === true
+    || data?.solo_centro === true
+    || (data?.enviado_en != null && data?.historial_guardado === true);
+}
+
 async function reclamarEvento(eventKey, payload) {
   const ref = db.collection('notificaciones_enviadas').doc(hashEventKey(eventKey));
+  const crearReserva = () => ref.create({
+    event_key: eventKey,
+    tipo: payload.type || 'oasis',
+    estado: 'procesando',
+    fecha_creacion: FieldValue.serverTimestamp()
+  });
+
   try {
-    await ref.create({
-      event_key: eventKey,
-      tipo: payload.type || 'oasis',
-      fecha_creacion: FieldValue.serverTimestamp()
-    });
+    await crearReserva();
     return ref;
   } catch (error) {
     // ALREADY_EXISTS en gRPC suele llegar como código 6.
-    if (error?.code === 6 || error?.code === 'ALREADY_EXISTS') return null;
-    throw error;
+    if (error?.code !== 6 && error?.code !== 'ALREADY_EXISTS') throw error;
+
+    let existing = await ref.get();
+    if (!existing.exists) {
+      // La reserva pudo eliminarse entre el error ALREADY_EXISTS y la lectura.
+      try {
+        await crearReserva();
+        return ref;
+      } catch (retryError) {
+        if (retryError?.code !== 6 && retryError?.code !== 'ALREADY_EXISTS') throw retryError;
+        existing = await ref.get();
+      }
+    }
+
+    const data = existing.data() || {};
+    if (eventoCompletado(data)) return null;
+
+    // Recuperar reservas huérfanas si una ejecución terminó abruptamente.
+    // El workflow tiene un límite de 6 minutos; 15 minutos evita competir
+    // con una ejecución normal que todavía esté procesando destinatarios.
+    const createdMs = toMillis(data.fecha_creacion);
+    if (createdMs !== null && Date.now() - createdMs > 15 * 60 * 1000) {
+      try {
+        await ref.delete();
+        await crearReserva();
+        return ref;
+      } catch (retryError) {
+        if (retryError?.code === 6 || retryError?.code === 'ALREADY_EXISTS') return null;
+        throw retryError;
+      }
+    }
+    return null;
   }
 }
 
@@ -351,8 +390,9 @@ async function actualizarUltimaRevision(ref) {
 }
 
 async function enviarEventoUnico(eventKey, notification, destinatarios) {
-  // El centro de notificaciones funciona aunque no haya tokens push. Si no hay
-  // usuarios objetivo, no se crea ni se consume el evento.
+  // Se conserva una clave principal para el evento y una clave independiente
+  // por cuenta. Si FCM falla para algunos usuarios, el siguiente ciclo solo
+  // vuelve a intentar a los que no tuvieron ninguna entrega push exitosa.
   if (!Array.isArray(destinatarios) || destinatarios.length === 0) {
     console.warn(`[NOTIFICACIONES] Evento ${notification.type || eventKey} sin usuarios destinatarios.`);
     return false;
@@ -360,30 +400,66 @@ async function enviarEventoUnico(eventKey, notification, destinatarios) {
 
   const claim = await reclamarEvento(eventKey, notification);
   if (!claim) return false;
+
+  let completados = 0;
+  let fallidos = 0;
   try {
-    const resultado = await enviarNotificacion(destinatarios, notification, eventKey);
-    // sendEach puede completar sin lanzar excepción aunque todos los tokens fallen.
-    // En ese caso liberamos el evento para que el próximo cron pueda reintentarlo.
-    if (!resultado.successCount) {
-      if (!resultado.tokensDisponibles) {
-        await claim.set({
-          envios_exitosos: 0,
-          envios_fallidos: 0,
-          destinatarios: resultado.destinatarios,
+    for (const usuario of destinatarios) {
+      const userEventKey = `${eventKey}|destinatario|${usuario.uid}`;
+      const userClaim = await reclamarEvento(userEventKey, notification);
+      if (!userClaim) {
+        // Ya se procesó la cuenta en un ciclo anterior; no repetir su push.
+        completados += 1;
+        continue;
+      }
+
+      try {
+        const resultado = await enviarNotificacion([usuario], notification, userEventKey);
+        if (!resultado.successCount) {
+          if (!resultado.tokensDisponibles) {
+            // Aunque no tenga push activo, el aviso ya quedó en el centro de la app.
+            await userClaim.set({
+              envios_exitosos: 0,
+              envios_fallidos: 0,
+              destinatarios: 1,
+              historial_guardado: true,
+              solo_centro: true,
+              enviado_en: FieldValue.serverTimestamp()
+            }, { merge: true });
+            completados += 1;
+            continue;
+          }
+          await liberarEvento(userClaim);
+          fallidos += 1;
+          continue;
+        }
+
+        await userClaim.set({
+          envios_exitosos: resultado.successCount,
+          envios_fallidos: resultado.failureCount,
+          destinatarios: 1,
           historial_guardado: true,
-          solo_centro: true,
           enviado_en: FieldValue.serverTimestamp()
         }, { merge: true });
-        return true;
+        completados += 1;
+      } catch (error) {
+        await liberarEvento(userClaim);
+        fallidos += 1;
+        console.warn(`[NOTIFICACIONES] Se reintentará ${notification.type || eventKey} para ${usuario.uid}: ${error.message}`);
       }
+    }
+
+    if (fallidos > 0) {
       await liberarEvento(claim);
-      console.warn(`[NOTIFICACIONES] Evento ${notification.type || eventKey} sin entregas push exitosas; se reintentará.`);
+      console.warn(`[NOTIFICACIONES] Evento ${notification.type || eventKey}: ${fallidos} destinatario(s) pendientes de reintento; ${completados} ya procesados.`);
       return false;
     }
+
     await claim.set({
-      envios_exitosos: resultado.successCount,
-      envios_fallidos: resultado.failureCount,
-      destinatarios: resultado.destinatarios,
+      completo: true,
+      envios_exitosos: completados,
+      envios_fallidos: 0,
+      destinatarios: destinatarios.length,
       historial_guardado: true,
       enviado_en: FieldValue.serverTimestamp()
     }, { merge: true });
@@ -412,7 +488,7 @@ async function procesarSuplencias(now, initializedAtMs) {
 
       for (const miembro of equipo) {
         if (!miembro?.suplencia_solicitada || !miembro?.id_usuario) continue;
-        const eventoMs = toMillis(miembro.suplencia_solicitada_en);
+        const eventoMs = toMillis(data.suplencias_solicitadas_en?.[miembro.id_usuario] || miembro.suplencia_solicitada_en);
         if (eventoMs === null || eventoMs <= initializedAtMs) continue;
 
         const eventKey = `suplencia|${docSnap.id}|${miembro.id_usuario}|${eventoMs}`;
@@ -477,6 +553,52 @@ async function procesarCanciones(now, initializedAtMs) {
   return procesadas;
 }
 
+
+async function procesarNotas(now, initializedAtMs) {
+  const monthKeys = [numeroMesClave(now), mesSiguienteClave(now)];
+  const snapshots = await Promise.all(monthKeys.map(key => db.collection('horarios_servicios').where('mes_anio', '==', key).get()));
+  const cacheUsuarios = new Map();
+  let procesadas = 0;
+
+  async function nombreUsuario(uid) {
+    if (!uid) return 'El director/operador';
+    if (cacheUsuarios.has(uid)) return cacheUsuarios.get(uid);
+    const snap = await db.collection('usuarios').doc(uid).get();
+    const nombre = snap.exists ? (snap.data()?.nombre_completo || 'El director/operador') : 'El director/operador';
+    cacheUsuarios.set(uid, nombre);
+    return nombre;
+  }
+
+  for (const snap of snapshots) {
+    for (const docSnap of snap.docs) {
+      const data = docSnap.data() || {};
+      const updatedMs = toMillis(data.notas_actualizadas_en);
+      const actorUid = data.notas_actualizadas_por || '';
+      if (updatedMs === null || updatedMs <= initializedAtMs) continue;
+      const ids = [...new Set((Array.isArray(data.equipo) ? data.equipo : [])
+        .map(miembro => miembro?.id_usuario).filter(Boolean))];
+      if (!ids.length) continue;
+
+      const info = parseMesAnio(data.mes_anio);
+      const dia = Number(data.dia);
+      const fechaServicio = info && Number.isInteger(dia)
+        ? DateTime.fromObject({ year: info.anio, month: info.mes, day: dia }, { zone: APP_TIMEZONE })
+        : null;
+      const fechaTexto = fechaServicio?.isValid ? formatoFecha(fechaServicio) : `día ${dia}`;
+      const actor = await nombreUsuario(actorUid);
+      const destinatarios = await obtenerDestinatarios(ids, actorUid);
+      const eventKey = `notas_arreglo|${docSnap.id}|${updatedMs}`;
+      const sent = await enviarEventoUnico(eventKey, {
+        title: '📝 Notas de arreglo actualizadas',
+        body: `${actor} actualizó las notas para ${data.descripcion_servicio || 'el servicio'} — ${fechaTexto}.`,
+        type: 'notas_actualizadas',
+        extra: { horarioId: docSnap.id }
+      }, destinatarios);
+      if (sent) procesadas += 1;
+    }
+  }
+  return procesadas;
+}
 
 function momentosAvisoCalendario(fechaEvento, now) {
   if (!fechaEvento || !fechaEvento.isValid || !now || !now.isValid) return [];
@@ -739,7 +861,10 @@ async function procesarAperturaMesSiguiente(now, initializedAtMs) {
   const data = snap.data() || {};
   const nextMonth = now.plus({ months: 1 });
   const nextMonthKey = numeroMesClave(nextMonth);
-  const plazoProgramado = data.plazos_disponibilidad && data.plazos_disponibilidad[nextMonthKey];
+  const targetMonthKey = /^\d{1,2}-\d{4}$/.test(String(data.siguiente_mes_abierto_para || ''))
+    ? String(data.siguiente_mes_abierto_para)
+    : nextMonthKey;
+  const plazoProgramado = data.plazos_disponibilidad && data.plazos_disponibilidad[targetMonthKey];
   const inicioPlazo = String(plazoProgramado?.inicio || '');
   const limitePlazo = String(plazoProgramado?.limite || '');
   if (/^\d{4}-\d{2}-\d{2}$/.test(inicioPlazo)
@@ -749,14 +874,51 @@ async function procesarAperturaMesSiguiente(now, initializedAtMs) {
 
   const openedMs = toMillis(data.siguiente_mes_abierto_en);
   if (openedMs === null || openedMs <= initializedAtMs) return 0;
+  const targetMonthInfo = parseMesAnio(targetMonthKey);
+  if (!targetMonthInfo) return 0;
+  const targetMonth = DateTime.fromObject({ year: targetMonthInfo.anio, month: targetMonthInfo.mes, day: 1 }, { zone: APP_TIMEZONE });
+  if (!targetMonth.isValid) return 0;
 
-  const eventKey = `disponibilidad_mes_siguiente|${nextMonthKey}|${openedMs}`;
+  const eventKey = `disponibilidad_mes_siguiente|${targetMonthKey}|${openedMs}`;
   const destinatarios = await obtenerTodosDestinatarios();
   const sent = await enviarEventoUnico(eventKey, {
     title: '🗓️ Disponibilidades abiertas',
-    body: `Ya puedes llenar tu disponibilidad para ${nextMonth.setLocale('es').toFormat("LLLL 'de' yyyy")}.`,
+    body: `Ya puedes llenar tu disponibilidad para ${targetMonth.setLocale('es').toFormat("LLLL 'de' yyyy")}.`,
     type: 'disponibilidad_mes_siguiente_abierta',
-    extra: { mes_anio: nextMonthKey }
+    extra: { mes_anio: targetMonthKey }
+  }, destinatarios);
+  return sent ? 1 : 0;
+}
+
+async function procesarCierreMesSiguiente(now, initializedAtMs) {
+  const snap = await db.collection('configuracion').doc('general').get();
+  if (!snap.exists) return 0;
+  const data = snap.data() || {};
+  if (data.siguiente_mes_abierto !== false) return 0;
+
+  const closedMs = toMillis(data.siguiente_mes_cerrado_en);
+  if (closedMs === null || closedMs <= initializedAtMs) return 0;
+  const targetMonthKey = /^\d{1,2}-\d{4}$/.test(String(data.siguiente_mes_cerrado_para || ''))
+    ? String(data.siguiente_mes_cerrado_para)
+    : mesSiguienteClave(now);
+  const plazoProgramado = data.plazos_disponibilidad && data.plazos_disponibilidad[targetMonthKey];
+  const inicioPlazo = String(plazoProgramado?.inicio || '');
+  const limitePlazo = String(plazoProgramado?.limite || '');
+  if (/^\d{4}-\d{2}-\d{2}$/.test(inicioPlazo)
+      && /^\d{4}-\d{2}-\d{2}$/.test(limitePlazo)
+      && inicioPlazo <= limitePlazo) return 0;
+
+  const info = parseMesAnio(targetMonthKey);
+  if (!info) return 0;
+  const targetMonth = DateTime.fromObject({ year: info.anio, month: info.mes, day: 1 }, { zone: APP_TIMEZONE });
+  if (!targetMonth.isValid) return 0;
+  const eventKey = `disponibilidad_mes_siguiente_cerrada|${targetMonthKey}|${closedMs}`;
+  const destinatarios = await obtenerTodosDestinatarios();
+  const sent = await enviarEventoUnico(eventKey, {
+    title: '⛔ Disponibilidades cerradas',
+    body: `Se cerró la disponibilidad para ${targetMonth.setLocale('es').toFormat("LLLL 'de' yyyy")}. Ya no se pueden registrar cambios por la vía normal.`,
+    type: 'disponibilidad_mes_siguiente_cerrada',
+    extra: { mes_anio: targetMonthKey }
   }, destinatarios);
   return sent ? 1 : 0;
 }
@@ -838,105 +1000,148 @@ async function procesarAvisosPlazoDisponibilidad(now) {
   return procesadas;
 }
 
-async function procesarLlamadosChatPendientes() {
-  const solicitudes = await db.collection('solicitudes_llamado_chat')
-    .where('estado', '==', 'pendiente')
-    .limit(25)
-    .get();
+async function actualizarEstadoSolicitud(ref, estado, campos = {}) {
+  await ref.set({
+    estado,
+    actualizado_en: FieldValue.serverTimestamp(),
+    ...campos
+  }, { merge: true });
+}
+
+async function registrarFalloSolicitud(ref, data, error) {
+  const intentos = Number(data.intentos || 0) + 1;
+  const maxIntentos = 8;
+  const estado = intentos >= maxIntentos ? 'fallido' : 'pendiente';
+  await actualizarEstadoSolicitud(ref, estado, {
+    intentos,
+    ultimo_error: String(error?.message || error || 'Error desconocido').slice(0, 500)
+  }).catch(updateError => console.error('[NOTIFICACIONES] No se pudo actualizar el estado de la solicitud:', updateError.message));
+  console.error(`[NOTIFICACIONES] Solicitud ${ref.id} falló en el intento ${intentos}:`, error?.message || error);
+}
+
+async function eventoYaRegistrado(eventKey) {
+  const snap = await db.collection('notificaciones_enviadas').doc(hashEventKey(eventKey)).get();
+  return snap.exists && eventoCompletado(snap.data() || {});
+}
+
+async function procesarLlamadosChat(now) {
+  const snap = await db.collection('solicitudes_llamado_chat').where('estado', '==', 'pendiente').get();
   let procesadas = 0;
-
-  for (const solicitudSnap of solicitudes.docs) {
-    const solicitudRef = solicitudSnap.ref;
-    // Reclamo atómico: evita que dos ejecuciones procesen la misma llamada.
-    const reclamada = await db.runTransaction(async transaction => {
-      const actual = await transaction.get(solicitudRef);
-      if (!actual.exists || actual.data()?.estado !== 'pendiente') return false;
-      transaction.update(solicitudRef, {
-        estado: 'procesando',
-        procesado_inicio: FieldValue.serverTimestamp()
-      });
-      return true;
-    });
-    if (!reclamada) continue;
-
+  for (const solicitud of snap.docs) {
+    const data = solicitud.data() || {};
     try {
-      const solicitud = solicitudSnap.data() || {};
-      const horarioId = String(solicitud.horario_id || '').trim();
-      const callerUid = String(solicitud.caller_uid || '').trim();
+      const horarioId = String(data.horario_id || '').trim();
+      const callerUid = String(data.caller_uid || '').trim();
       if (!horarioId || !callerUid) {
-        await solicitudRef.update({ estado: 'rechazado', error: 'Solicitud incompleta.', procesado_fin: FieldValue.serverTimestamp() });
-        procesadas += 1;
+        await actualizarEstadoSolicitud(solicitud.ref, 'rechazado', { motivo: 'Faltan datos del llamado.' });
         continue;
       }
-
-      const [horarioSnap, callerSnap] = await Promise.all([
-        db.collection('horarios_servicios').doc(horarioId).get(),
-        db.collection('usuarios').doc(callerUid).get()
-      ]);
-      if (!horarioSnap.exists || !callerSnap.exists) {
-        await solicitudRef.update({ estado: 'rechazado', error: 'No se encontró el horario o la cuenta solicitante.', procesado_fin: FieldValue.serverTimestamp() });
-        procesadas += 1;
+      const horarioSnap = await db.collection('horarios_servicios').doc(horarioId).get();
+      if (!horarioSnap.exists) {
+        await actualizarEstadoSolicitud(solicitud.ref, 'rechazado', { motivo: 'El servicio ya no existe.' });
         continue;
       }
       const horario = horarioSnap.data() || {};
-      const participantes = [...new Set((Array.isArray(horario.equipo) ? horario.equipo : [])
-        .map(miembro => String(miembro?.id_usuario || miembro?.uid || ''))
-        .filter(Boolean))];
-      // No confiar en la lista de destinatarios enviada por el navegador: se lee el equipo actual desde Firestore.
-      if (!participantes.includes(callerUid)) {
-        await solicitudRef.update({ estado: 'rechazado', error: 'La persona solicitante no pertenece al equipo de este servicio.', procesado_fin: FieldValue.serverTimestamp() });
-        procesadas += 1;
+      const equipo = Array.isArray(horario.equipo) ? horario.equipo : [];
+      const ids = [...new Set(equipo.map(miembro => String(miembro?.id_usuario || '').trim()).filter(Boolean))];
+      if (!ids.includes(callerUid)) {
+        await actualizarEstadoSolicitud(solicitud.ref, 'rechazado', { motivo: 'La persona que solicita el llamado no está asignada a este servicio.' });
         continue;
       }
-      const destinatariosIds = participantes.filter(uid => uid !== callerUid);
-      if (!destinatariosIds.length) {
-        await solicitudRef.update({ estado: 'sin_destinatarios', destinatarios: 0, procesado_fin: FieldValue.serverTimestamp() });
-        procesadas += 1;
+      const destinatarioIds = ids.filter(uid => uid !== callerUid);
+      if (!destinatarioIds.length) {
+        await actualizarEstadoSolicitud(solicitud.ref, 'sin_destinatarios', { destinatarios: 0 });
         continue;
       }
-
-      const destinatarios = await obtenerDestinatarios(destinatariosIds);
-      const callerData = callerSnap.data() || {};
-      const callerName = String(callerData.nombre_completo || 'Un integrante').slice(0, 100);
-      const descripcion = String(horario.descripcion_servicio || 'servicio').slice(0, 150);
-      const fechaDia = Number(horario.dia);
-      const fechaMes = parseMesAnio(horario.mes_anio);
-      let fechaTexto = '';
-      if (fechaMes && Number.isInteger(fechaDia)) {
-        const fecha = DateTime.fromObject({ year: fechaMes.anio, month: fechaMes.mes, day: fechaDia }, { zone: APP_TIMEZONE });
-        if (fecha.isValid) fechaTexto = ` del ${fecha.setLocale('es').toFormat("cccc d 'de' LLLL")}`;
+      const callerSnap = await db.collection('usuarios').doc(callerUid).get();
+      const callerName = callerSnap.exists
+        ? String(callerSnap.data()?.nombre_completo || 'Un integrante')
+        : String(data.caller_nombre || 'Un integrante');
+      const destinatarios = await obtenerDestinatarios(destinatarioIds);
+      if (!destinatarios.length) {
+        await actualizarEstadoSolicitud(solicitud.ref, 'sin_destinatarios', { destinatarios: 0 });
+        continue;
       }
-      const notificacion = {
-        title: `🔔 ${callerName} está llamando al equipo`,
-        body: `Aviso para los participantes de ${descripcion}${fechaTexto}. Abre A.S.A.F. para revisar el chat del servicio.`,
-        type: 'chat_llamado_equipo',
-        extra: { horarioId, solicitudLlamadoId: solicitudSnap.id }
-      };
-
-      const enviado = await enviarEventoUnico(`chat_llamado|${solicitudSnap.id}`, notificacion, destinatarios);
-      if (enviado) {
-        await solicitudRef.update({
-          estado: 'enviado',
-          destinatarios: destinatarios.length,
-          completado_en: FieldValue.serverTimestamp()
-        });
-      } else {
-        await solicitudRef.update({
-          estado: 'fallido',
-          destinatarios: destinatarios.length,
-          error: destinatarios.length ? 'El envío no pudo confirmarse.' : 'No hay otros participantes con perfil disponible.',
-          completado_en: FieldValue.serverTimestamp()
-        });
+      const eventKey = `llamado_chat|${solicitud.id}`;
+      const fechaTexto = parseMesAnio(horario.mes_anio) && Number.isInteger(Number(horario.dia))
+        ? formatoFecha(DateTime.fromObject({ year: parseMesAnio(horario.mes_anio).anio, month: parseMesAnio(horario.mes_anio).mes, day: Number(horario.dia) }, { zone: APP_TIMEZONE }))
+        : 'el servicio';
+      const sent = await enviarEventoUnico(eventKey, {
+        title: '📣 Llamado del chat del servicio',
+        body: `${callerName} está llamando a todos los participantes de «${horario.descripcion_servicio || 'el servicio'}» (${fechaTexto}). Entra al chat para revisar el mensaje.`,
+        type: 'llamado_chat',
+        extra: { horarioId: horarioId, solicitudId: solicitud.id }
+      }, destinatarios);
+      if (sent || await eventoYaRegistrado(eventKey)) {
+        await actualizarEstadoSolicitud(solicitud.ref, 'enviado', { destinatarios: destinatarios.length, enviado_en: FieldValue.serverTimestamp() });
+        procesadas += 1;
       }
-      procesadas += 1;
     } catch (error) {
-      console.error(`[NOTIFICACIONES] Falló llamado de chat ${solicitudSnap.id}:`, error?.message || error);
-      await solicitudRef.update({
-        estado: 'fallido',
-        error: String(error?.message || 'Error al enviar el llamado.').slice(0, 300),
-        completado_en: FieldValue.serverTimestamp()
-      }).catch(updateError => console.error('[NOTIFICACIONES] No se pudo marcar la solicitud fallida:', updateError?.message || updateError));
-      procesadas += 1;
+      await registrarFalloSolicitud(solicitud.ref, data, error);
+    }
+  }
+  return procesadas;
+}
+
+async function procesarRecordatoriosManuales(now) {
+  const snap = await db.collection('solicitudes_recordatorio_horario').where('estado', '==', 'pendiente').get();
+  let procesadas = 0;
+  for (const solicitud of snap.docs) {
+    const data = solicitud.data() || {};
+    try {
+      const requestedBy = String(data.requested_by || '').trim();
+      const horarioId = String(data.horario_id || '').trim();
+      if (!requestedBy || !horarioId) {
+        await actualizarEstadoSolicitud(solicitud.ref, 'rechazado', { motivo: 'Faltan datos del recordatorio.' });
+        continue;
+      }
+      const operadorSnap = await db.collection('usuarios').doc(requestedBy).get();
+      if (!operadorSnap.exists || operadorSnap.data()?.es_operador !== true) {
+        await actualizarEstadoSolicitud(solicitud.ref, 'rechazado', { motivo: 'Solo un operador puede solicitar recordatorios manuales.' });
+        continue;
+      }
+      const horarioSnap = await db.collection('horarios_servicios').doc(horarioId).get();
+      if (!horarioSnap.exists) {
+        await actualizarEstadoSolicitud(solicitud.ref, 'rechazado', { motivo: 'El servicio ya no existe.' });
+        continue;
+      }
+      const horario = horarioSnap.data() || {};
+      const mesClave = String(horario.mes_anio || '');
+      const publicacionSnap = mesClave ? await db.collection('publicaciones_horarios').doc(mesClave).get() : null;
+      if (!publicacionSnap?.exists || publicacionSnap.data()?.visible !== true) {
+        await actualizarEstadoSolicitud(solicitud.ref, 'rechazado', { motivo: 'El horario no está publicado.' });
+        continue;
+      }
+      const equipo = Array.isArray(horario.equipo) ? horario.equipo : [];
+      const ids = [...new Set(equipo.map(miembro => String(miembro?.id_usuario || '').trim()).filter(Boolean))];
+      if (!ids.length) {
+        await actualizarEstadoSolicitud(solicitud.ref, 'sin_destinatarios', { destinatarios: 0 });
+        continue;
+      }
+      const destinatarios = await obtenerDestinatarios(ids);
+      if (!destinatarios.length) {
+        await actualizarEstadoSolicitud(solicitud.ref, 'sin_destinatarios', { destinatarios: 0 });
+        continue;
+      }
+      const info = parseMesAnio(mesClave);
+      const dia = Number(horario.dia);
+      const fechaServicio = info && Number.isInteger(dia)
+        ? DateTime.fromObject({ year: info.anio, month: info.mes, day: dia }, { zone: APP_TIMEZONE })
+        : null;
+      const fechaTexto = fechaServicio?.isValid ? formatoFecha(fechaServicio) : 'la fecha del servicio';
+      const eventKey = `recordatorio_manual_horario|${solicitud.id}`;
+      const sent = await enviarEventoUnico(eventKey, {
+        title: '🔔 Recordatorio de servicio',
+        body: `Recuerda tu asignación para «${horario.descripcion_servicio || 'el servicio'}» — ${fechaTexto}. Consulta tu horario y el repertorio en A.S.A.F.`,
+        type: 'recordatorio_manual_servicio',
+        extra: { horarioId: horarioId, recordatorioId: solicitud.id, mes_anio: mesClave, dia: String(horario.dia || '') }
+      }, destinatarios);
+      if (sent || await eventoYaRegistrado(eventKey)) {
+        await actualizarEstadoSolicitud(solicitud.ref, 'enviado', { destinatarios: destinatarios.length, enviado_en: FieldValue.serverTimestamp() });
+        procesadas += 1;
+      }
+    } catch (error) {
+      await registrarFalloSolicitud(solicitud.ref, data, error);
     }
   }
   return procesadas;
@@ -951,7 +1156,6 @@ async function ejecutarRevision() {
     const estado = await obtenerEstadoBackend();
     if (!estado.inicializado) {
       console.log('[NOTIFICACIONES] Primera ejecución: se creó la línea base. No se enviarán eventos antiguos.');
-      await procesarLlamadosChatPendientes();
       await actualizarUltimaRevision(estado.ref);
       return;
     }
@@ -966,13 +1170,16 @@ async function ejecutarRevision() {
     const resultados = await Promise.allSettled([
       procesarSuplencias(inicio, initializedAtMs),
       procesarCanciones(inicio, initializedAtMs),
+      procesarNotas(inicio, initializedAtMs),
       procesarAsignaciones(inicio),
       procesarAsignacionesOracion(inicio),
       procesarEnsayos(inicio),
+      procesarLlamadosChat(inicio),
+      procesarRecordatoriosManuales(inicio),
       procesarAperturaMesSiguiente(inicio, initializedAtMs),
+      procesarCierreMesSiguiente(inicio, initializedAtMs),
       procesarPublicacionHorarios(),
-      procesarAvisosPlazoDisponibilidad(inicio),
-      procesarLlamadosChatPendientes()
+      procesarAvisosPlazoDisponibilidad(inicio)
     ]);
     const errores = resultados.filter(resultado => resultado.status === 'rejected');
     if (errores.length) {
@@ -981,10 +1188,10 @@ async function ejecutarRevision() {
         `${errores.length} proceso(s) de notificación fallaron.`
       );
     }
-    const [suplencias, canciones, asignaciones, oraciones, ensayos, aperturaMes, publicacionHorarios, plazosDisponibilidad, llamadosChat] = resultados.map(resultado => resultado.value);
+    const [suplencias, canciones, notas, asignaciones, oraciones, ensayos, llamadosChat, recordatoriosManuales, aperturaMes, cierreMes, publicacionHorarios, plazosDisponibilidad] = resultados.map(resultado => resultado.value);
 
     await actualizarUltimaRevision(estado.ref);
-    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} asignaciones=${asignaciones} oraciones=${oraciones} ensayos=${ensayos} aperturaMes=${aperturaMes} publicacionHorarios=${publicacionHorarios} avisosPlazo=${plazosDisponibilidad} llamadosChat=${llamadosChat}`);
+    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} notas=${notas} asignaciones=${asignaciones} oraciones=${oraciones} ensayos=${ensayos} llamadosChat=${llamadosChat} recordatoriosManuales=${recordatoriosManuales} aperturaMes=${aperturaMes} cierreMes=${cierreMes} publicacionHorarios=${publicacionHorarios} avisosPlazo=${plazosDisponibilidad}`);
   } catch (error) {
     console.error('[NOTIFICACIONES] Error durante la revisión:', error);
     // En GitHub Actions --once debe devolver un código distinto de cero si

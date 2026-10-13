@@ -3,7 +3,12 @@ name: Notificaciones Oasis
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/5 * * * *'
+    # Cada 5 minutos de 7:00 a 20:55, hora de Caracas.
+    - cron: '*/5 7-20 * * *'
+      timezone: 'America/Caracas'
+    # Última revisión diaria a las 21:00 (9:00 p. m.).
+    - cron: '0 21 * * *'
+      timezone: 'America/Caracas'
 
 permissions:
   contents: read

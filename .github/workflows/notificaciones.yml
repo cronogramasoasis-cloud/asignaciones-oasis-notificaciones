@@ -3,8 +3,7 @@ name: Notificaciones Oasis
 on:
   workflow_dispatch:
   schedule:
-    # Cada 15 minutos; el minuto de inicio se desplaza para evitar horas pico.
-    - cron: '7,22,37,52 * * * *'
+    - cron: '*/5 * * * *'
 
 permissions:
   contents: read

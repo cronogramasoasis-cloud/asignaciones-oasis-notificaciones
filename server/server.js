@@ -7,13 +7,13 @@ const express = require('express');
 const cron = require('node-cron');
 const { DateTime } = require('luxon');
 const { initializeApp, cert, applicationDefault } = require('firebase-admin/app');
-const { getFirestore, FieldValue, FieldPath } = require('firebase-admin/firestore');
+const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 const { getMessaging } = require('firebase-admin/messaging');
 
 const APP_TIMEZONE = process.env.APP_TIMEZONE || 'America/Caracas';
 const PUBLIC_APP_URL = process.env.PUBLIC_APP_URL || 'https://cronogramas-oasis.netlify.app/';
 const PORT = Number(process.env.PORT || 3000);
-const CRON_SCHEDULE = process.env.CRON_SCHEDULE || '7,22,37,52 * * * *';
+const CRON_SCHEDULE = process.env.CRON_SCHEDULE || '* * * * *';
 const RUN_ONCE = process.env.RUN_ONCE === 'true' || process.argv.includes('--once');
 
 const DAY_BEFORE_NOON_HOUR = Number(process.env.AVISO_DIA_ANTERIOR_MEDIODIA_HORA ?? 12);
@@ -22,6 +22,7 @@ const DAY_BEFORE_HOUR = Number(process.env.ENSAYO_AVISO_DIA_ANTERIOR_HORA ?? 18)
 const DAY_BEFORE_MINUTE = Number(process.env.ENSAYO_AVISO_DIA_ANTERIOR_MINUTO ?? 0);
 const SAME_DAY_HOUR = Number(process.env.ENSAYO_AVISO_MISMO_DIA_HORA ?? 8);
 const SAME_DAY_MINUTE = Number(process.env.ENSAYO_AVISO_MISMO_DIA_MINUTO ?? 0);
+const EVENT_PROCESSING_LEASE_MS = 8 * 60 * 1000;
 
 function fail(message) {
   console.error(`[NOTIFICACIONES] ${message}`);
@@ -83,10 +84,6 @@ if (!RUN_ONCE) {
 }
 
 let cronEnCurso = false;
-let destinatariosTodosPromise = null;
-let perfilesUsuariosPromises = new Map();
-let snapshotsHorariosPorMes = new Map();
-let publicacionesVisiblesPromise = null;
 
 function numeroMesClave(month) {
   return `${month.month}-${month.year}`;
@@ -123,11 +120,18 @@ function toMillis(value) {
 
 function parseHora(hora) {
   const text = String(hora || '').trim();
-  const match = text.match(/^(\d{1,2}):(\d{2})/);
+  const match = text.match(/^(\d{1,2}):(\d{2})(?:\s*([ap])\.?\s*m\.?)?$/i);
   if (!match) return null;
-  const hour = Number(match[1]);
+  let hour = Number(match[1]);
   const minute = Number(match[2]);
-  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  const meridiano = String(match[3] || '').toLowerCase();
+  if (minute < 0 || minute > 59) return null;
+  if (meridiano) {
+    if (hour < 1 || hour > 12) return null;
+    hour = hour % 12 + (meridiano === 'p' ? 12 : 0);
+  } else if (hour < 0 || hour > 23) {
+    return null;
+  }
   return { hour, minute };
 }
 
@@ -157,58 +161,47 @@ function hashEventKey(eventKey) {
 }
 
 function eventoCompletado(data) {
-  return data?.completo === true
-    || data?.solo_centro === true
-    || (data?.enviado_en != null && data?.historial_guardado === true);
+  if (!data || typeof data !== 'object') return false;
+  if (data.estado === 'pendiente' || data.estado === 'procesando') return false;
+  if (data.estado === 'enviado' || data.estado === 'solo_centro') return true;
+  if (data.solo_centro === true) return true;
+  return toMillis(data.enviado_en) !== null && Number(data.envios_exitosos || 0) > 0;
+}
+
+async function eventoYaCompletado(eventKey) {
+  const ref = db.collection('notificaciones_enviadas').doc(hashEventKey(eventKey));
+  const snap = await ref.get();
+  return snap.exists && eventoCompletado(snap.data() || {});
 }
 
 async function reclamarEvento(eventKey, payload) {
   const ref = db.collection('notificaciones_enviadas').doc(hashEventKey(eventKey));
-  const crearReserva = () => ref.create({
-    event_key: eventKey,
-    tipo: payload.type || 'oasis',
-    estado: 'procesando',
-    fecha_creacion: FieldValue.serverTimestamp()
+  const ahoraMs = Date.now();
+  const reclamada = await db.runTransaction(async transaction => {
+    const snap = await transaction.get(ref);
+    const anterior = snap.exists ? (snap.data() || {}) : {};
+    if (snap.exists) {
+      if (eventoCompletado(anterior)) return false;
+      const venceMs = toMillis(anterior.procesando_hasta);
+      if (anterior.estado === 'procesando' && venceMs !== null && venceMs > ahoraMs) return false;
+      // Compatibilidad con reservas antiguas que no tenían estado ni vencimiento.
+      // Si son recientes, podrían pertenecer a otro proceso todavía activo.
+      const creadoMs = toMillis(anterior.fecha_creacion);
+      if (!anterior.estado && creadoMs !== null && ahoraMs - creadoMs < EVENT_PROCESSING_LEASE_MS) return false;
+    }
+
+    const cambios = {
+      event_key: eventKey,
+      tipo: payload.type || 'oasis',
+      estado: 'procesando',
+      procesando_hasta: new Date(ahoraMs + EVENT_PROCESSING_LEASE_MS),
+      ultima_actualizacion: FieldValue.serverTimestamp()
+    };
+    if (!snap.exists || !anterior.fecha_creacion) cambios.fecha_creacion = FieldValue.serverTimestamp();
+    transaction.set(ref, cambios, { merge: true });
+    return true;
   });
-
-  try {
-    await crearReserva();
-    return ref;
-  } catch (error) {
-    // ALREADY_EXISTS en gRPC suele llegar como código 6.
-    if (error?.code !== 6 && error?.code !== 'ALREADY_EXISTS') throw error;
-
-    let existing = await ref.get();
-    if (!existing.exists) {
-      // La reserva pudo eliminarse entre el error ALREADY_EXISTS y la lectura.
-      try {
-        await crearReserva();
-        return ref;
-      } catch (retryError) {
-        if (retryError?.code !== 6 && retryError?.code !== 'ALREADY_EXISTS') throw retryError;
-        existing = await ref.get();
-      }
-    }
-
-    const data = existing.data() || {};
-    if (eventoCompletado(data)) return null;
-
-    // Recuperar reservas huérfanas si una ejecución terminó abruptamente.
-    // El workflow tiene un límite de 6 minutos; 15 minutos evita competir
-    // con una ejecución normal que todavía esté procesando destinatarios.
-    const createdMs = toMillis(data.fecha_creacion);
-    if (createdMs !== null && Date.now() - createdMs > 15 * 60 * 1000) {
-      try {
-        await ref.delete();
-        await crearReserva();
-        return ref;
-      } catch (retryError) {
-        if (retryError?.code === 6 || retryError?.code === 'ALREADY_EXISTS') return null;
-        throw retryError;
-      }
-    }
-    return null;
-  }
+  return reclamada ? ref : null;
 }
 
 async function liberarEvento(ref) {
@@ -241,195 +234,45 @@ async function quitarTokensInvalidos(invalidByUser) {
 }
 
 async function obtenerDestinatarios(userIds, excluirUid = '') {
-  const uniqueIds = [...new Set((userIds || [])
-    .map(uid => String(uid || '').trim())
-    .filter(uid => uid && uid !== String(excluirUid || '').trim()))];
+  const uniqueIds = [...new Set((userIds || []).filter(Boolean).filter(uid => uid !== excluirUid))];
   if (!uniqueIds.length) return [];
 
-  // Comparte perfiles entre procesadores de la misma revisión y hace una sola
-  // lectura por UID. Los perfiles se cargan en lotes únicamente cuando se piden.
-  const perfiles = await obtenerPerfilesUsuariosEnEjecucion(uniqueIds);
-  return uniqueIds.map(uid => {
-    const data = perfiles.get(uid);
-    if (!data) return null;
+  const refs = uniqueIds.map(uid => db.collection('usuarios').doc(uid));
+  const docs = await db.getAll(...refs);
+  const destinatarios = [];
+
+  docs.forEach(snapshot => {
+    if (!snapshot.exists) return;
+    const data = snapshot.data() || {};
     const tokens = data.fcm_push_enabled === false
       ? []
       : (Array.isArray(data.fcm_tokens) ? data.fcm_tokens.filter(Boolean) : []);
-    return {
-      uid,
+    destinatarios.push({
+      uid: snapshot.id,
       nombre: data.nombre_completo || 'Integrante',
       tokens: [...new Set(tokens)]
-    };
-  }).filter(Boolean);
-}
-
-// Carga perfiles solo bajo demanda, agrupando hasta 300 documentos por lote.
-// Las promesas por UID se registran antes de iniciar las lecturas para que los
-// procesadores paralelos compartan la misma petición y no dupliquen lecturas.
-async function obtenerPerfilesUsuariosEnEjecucion(userIds) {
-  const ids = [...new Set((userIds || []).map(uid => String(uid || '').trim()).filter(Boolean))];
-  if (!ids.length) return new Map();
-
-  const faltantes = ids.filter(uid => !perfilesUsuariosPromises.has(uid));
-  const pendientes = new Map();
-  for (const uid of faltantes) {
-    let resolvePromise;
-    let rejectPromise;
-    const promise = new Promise((resolve, reject) => {
-      resolvePromise = resolve;
-      rejectPromise = reject;
     });
-    const entrada = { promise, resolve: resolvePromise, reject: rejectPromise };
-    pendientes.set(uid, entrada);
-    perfilesUsuariosPromises.set(uid, promise);
-  }
-
-  if (faltantes.length) {
-    // La tarea maneja internamente los errores; los consumidores los reciben
-    // a través de las promesas registradas arriba.
-    void (async () => {
-      try {
-        for (let inicio = 0; inicio < faltantes.length; inicio += 300) {
-          const loteIds = faltantes.slice(inicio, inicio + 300);
-          const snapshots = await obtenerSnapshotsPorLotes(
-            loteIds.map(uid => db.collection('usuarios').doc(uid))
-          );
-          const datosPorUid = new Map(snapshots.map(snapshot => [
-            snapshot.id,
-            snapshot.exists ? (snapshot.data() || {}) : null
-          ]));
-          for (const uid of loteIds) pendientes.get(uid).resolve(datosPorUid.get(uid) || null);
-        }
-      } catch (error) {
-        for (const uid of faltantes) {
-          const entrada = pendientes.get(uid);
-          if (perfilesUsuariosPromises.get(uid) === entrada.promise) perfilesUsuariosPromises.delete(uid);
-          entrada.reject(error);
-        }
-      }
-    })();
-  }
-
-  const datos = await Promise.all(ids.map(uid => perfilesUsuariosPromises.get(uid)));
-  return new Map(ids.map((uid, index) => [uid, datos[index]]));
-}
-
-// Ejecuta lecturas de documentos en lotes en vez de leer uno por uno dentro de bucles.
-async function obtenerSnapshotsPorLotes(referencias, tamanoLote = 300) {
-  const unicas = [...new Map((referencias || []).filter(Boolean).map(ref => [ref.path, ref])).values()];
-  const resultados = [];
-  for (let inicio = 0; inicio < unicas.length; inicio += tamanoLote) {
-    const lote = unicas.slice(inicio, inicio + tamanoLote);
-    if (lote.length) resultados.push(...await db.getAll(...lote));
-  }
-  return resultados;
-}
-
-
-// Lee los nombres de varios usuarios en lotes para evitar una consulta por cada evento.
-async function obtenerNombresUsuarios(userIds) {
-  const ids = [...new Set((userIds || []).map(uid => String(uid || '').trim()).filter(Boolean))];
-  const perfiles = await obtenerPerfilesUsuariosEnEjecucion(ids);
-  const nombres = new Map();
-  for (const uid of ids) {
-    const data = perfiles.get(uid);
-    nombres.set(uid, data?.nombre_completo || 'El director/operador');
-  }
-  return nombres;
-}
-
-async function cargarTodosDestinatariosConDatos() {
-  const resultado = [];
-  const tamanoPagina = 500;
-  let ultimoDocumento = null;
-
-  // Cada página tiene límite; se pagina para no dejar usuarios fuera si hay más de 500.
-  while (true) {
-    let consulta = db.collection('usuarios').orderBy(FieldPath.documentId()).limit(tamanoPagina);
-    if (ultimoDocumento) consulta = consulta.startAfter(ultimoDocumento);
-    const snap = await consulta.get();
-    for (const snapshot of snap.docs) {
-      const data = snapshot.data() || {};
-      if (!perfilesUsuariosPromises.has(snapshot.id)) {
-        perfilesUsuariosPromises.set(snapshot.id, Promise.resolve(data));
-      }
-      const tokens = data.fcm_push_enabled === false
-        ? []
-        : (Array.isArray(data.fcm_tokens) ? data.fcm_tokens.filter(Boolean) : []);
-      resultado.push({
-        data,
-        destinatario: {
-          uid: snapshot.id,
-          nombre: data.nombre_completo || 'Integrante',
-          tokens: [...new Set(tokens)]
-        }
-      });
-    }
-    if (snap.size < tamanoPagina) break;
-    ultimoDocumento = snap.docs[snap.docs.length - 1];
-  }
-  return resultado;
-}
-
-async function obtenerTodosDestinatarios(filtro) {
-  if (!destinatariosTodosPromise) destinatariosTodosPromise = cargarTodosDestinatariosConDatos();
-  const registros = await destinatariosTodosPromise;
-  return registros
-    .filter(item => !filtro || filtro(item.data))
-    .map(item => item.destinatario);
-}
-
-// Consulta únicamente los perfiles que están marcados como operadores.
-// Se pagina para no omitir operadores si el proyecto crece por encima del límite.
-async function obtenerDestinatariosOperadores() {
-  const destinatarios = [];
-  const tamanoPagina = 500;
-  let ultimoDocumento = null;
-
-  while (true) {
-    let consulta = db.collection('usuarios')
-      .where('es_operador', '==', true)
-      .orderBy(FieldPath.documentId())
-      .limit(tamanoPagina);
-    if (ultimoDocumento) consulta = consulta.startAfter(ultimoDocumento);
-
-    const snap = await consulta.get();
-    for (const snapshot of snap.docs) {
-      const data = snapshot.data() || {};
-      if (!perfilesUsuariosPromises.has(snapshot.id)) {
-        perfilesUsuariosPromises.set(snapshot.id, Promise.resolve(data));
-      }
-      const tokens = data.fcm_push_enabled === false
-        ? []
-        : (Array.isArray(data.fcm_tokens) ? data.fcm_tokens.filter(Boolean) : []);
-      destinatarios.push({
-        uid: snapshot.id,
-        nombre: data.nombre_completo || 'Integrante',
-        tokens: [...new Set(tokens)]
-      });
-    }
-
-    if (snap.size < tamanoPagina) break;
-    ultimoDocumento = snap.docs[snap.docs.length - 1];
-  }
+  });
 
   return destinatarios;
 }
 
-function obtenerSnapshotHorariosMes(mesClave) {
-  const clave = String(mesClave || '');
-  if (!snapshotsHorariosPorMes.has(clave)) {
-    snapshotsHorariosPorMes.set(clave,
-      db.collection('horarios_servicios').where('mes_anio', '==', clave).limit(1000).get());
-  }
-  return snapshotsHorariosPorMes.get(clave);
-}
-
-function obtenerSnapshotPublicacionesVisibles() {
-  if (!publicacionesVisiblesPromise) {
-    publicacionesVisiblesPromise = db.collection('publicaciones_horarios').where('visible', '==', true).limit(500).get();
-  }
-  return publicacionesVisiblesPromise;
+async function obtenerTodosDestinatarios(filtro) {
+  const snap = await db.collection('usuarios').get();
+  const destinatarios = [];
+  snap.forEach(snapshot => {
+    const data = snapshot.data() || {};
+    if (filtro && !filtro(data)) return;
+    const tokens = data.fcm_push_enabled === false
+      ? []
+      : (Array.isArray(data.fcm_tokens) ? data.fcm_tokens.filter(Boolean) : []);
+    destinatarios.push({
+      uid: snapshot.id,
+      nombre: data.nombre_completo || 'Integrante',
+      tokens: [...new Set(tokens)]
+    });
+  });
+  return destinatarios;
 }
 
 async function registrarNotificacionEnCentro(uid, eventKey, notification) {
@@ -450,7 +293,9 @@ async function registrarNotificacionEnCentro(uid, eventKey, notification) {
     if (!snap.exists) return false;
     const data = snap.data() || {};
     const historial = Array.isArray(data.notificaciones_app) ? data.notificaciones_app : [];
-    if (historial.some(aviso => aviso && aviso.id === id)) return false;
+    // Una entrada ya existente también cuenta como guardada: es el caso normal
+    // cuando un envío push falló y el backend está reintentando el mismo evento.
+    if (historial.some(aviso => aviso && aviso.id === id)) return true;
     // Limitar el perfil a los 100 avisos más recientes para evitar que el
     // documento de usuario crezca sin límite y conservar la biblioteca/perfil existente.
     transaction.update(ref, { notificaciones_app: [...historial, item].slice(-100) });
@@ -459,16 +304,21 @@ async function registrarNotificacionEnCentro(uid, eventKey, notification) {
 }
 
 async function enviarNotificacion(destinatarios, { title, body, type, extra = {} }, eventKey = '') {
-  if (!destinatarios.length) return { successCount: 0, failureCount: 0, destinatarios: 0, tokensDisponibles: 0 };
+  if (!destinatarios.length) return { successCount: 0, failureCount: 0, destinatarios: 0, tokensDisponibles: 0, erroresCentro: 0 };
 
   // El historial se escribe en la misma cuenta de cada destinatario del push,
   // incluso si la notificación llega a varios de sus dispositivos.
   const guardados = await Promise.allSettled(destinatarios.map(user =>
     registrarNotificacionEnCentro(user.uid, eventKey, { title, body, type, extra })
   ));
+  let erroresCentro = 0;
   guardados.forEach((resultado, index) => {
-    if (resultado.status === 'rejected') {
-      console.warn(`[NOTIFICACIONES] No se guardó el aviso en el centro de ${destinatarios[index]?.uid}: ${resultado.reason?.message || resultado.reason}`);
+    if (resultado.status === 'rejected' || (resultado.status === 'fulfilled' && resultado.value === false)) {
+      erroresCentro += 1;
+      const detalle = resultado.status === 'rejected'
+        ? (resultado.reason?.message || resultado.reason)
+        : 'el perfil del usuario ya no existe';
+      console.warn(`[NOTIFICACIONES] No se guardó el aviso en el centro de ${destinatarios[index]?.uid}: ${detalle}`);
     }
   });
 
@@ -487,7 +337,7 @@ async function enviarNotificacion(destinatarios, { title, body, type, extra = {}
       });
     }
   }
-  if (!mensajes.length) return { successCount: 0, failureCount: 0, destinatarios: destinatarios.length, tokensDisponibles: 0 };
+  if (!mensajes.length) return { successCount: 0, failureCount: 0, destinatarios: destinatarios.length, tokensDisponibles: 0, erroresCentro };
 
   let successCount = 0;
   let failureCount = 0;
@@ -521,7 +371,7 @@ async function enviarNotificacion(destinatarios, { title, body, type, extra = {}
   }
 
   await quitarTokensInvalidos(invalidByUser);
-  return { successCount, failureCount, destinatarios: destinatarios.length, tokensDisponibles: mensajes.length };
+  return { successCount, failureCount, destinatarios: destinatarios.length, tokensDisponibles: mensajes.length, erroresCentro };
 }
 
 async function obtenerEstadoBackend() {
@@ -544,89 +394,112 @@ async function actualizarUltimaRevision(ref) {
 }
 
 async function enviarEventoUnico(eventKey, notification, destinatarios) {
-  // Se conserva una clave principal para el evento y una clave independiente
-  // por cuenta. Si FCM falla para algunos usuarios, el siguiente ciclo solo
-  // vuelve a intentar a los que no tuvieron ninguna entrega push exitosa.
-  // destinatarios también puede ser una función: así no se leen perfiles hasta
-  // que se confirma que el evento requiere procesamiento.
-  const cargarDestinatarios = typeof destinatarios === 'function';
-  if (!cargarDestinatarios && (!Array.isArray(destinatarios) || destinatarios.length === 0)) {
+  const porUid = new Map();
+  for (const destinatario of (Array.isArray(destinatarios) ? destinatarios : [])) {
+    if (destinatario?.uid && !porUid.has(destinatario.uid)) porUid.set(destinatario.uid, destinatario);
+  }
+  const unicos = [...porUid.values()];
+  if (!unicos.length) {
     console.warn(`[NOTIFICACIONES] Evento ${notification.type || eventKey} sin usuarios destinatarios.`);
     return false;
   }
 
+  // Las notificaciones generales se registran por destinatario. Si un usuario
+  // falla, el siguiente ciclo reintenta solo ese envío sin duplicar al resto.
+  if (unicos.length > 1) {
+    const claim = await reclamarEvento(eventKey, notification);
+    if (!claim) return false;
+    const clavesIndividuales = unicos.map(user => `${eventKey}|destinatario|${user.uid}`);
+    try {
+      const resultados = await Promise.allSettled(unicos.map(async (user, index) => {
+        const clave = clavesIndividuales[index];
+        if (await eventoYaCompletado(clave)) return true;
+        const completado = await enviarEventoUnico(clave, notification, [user]);
+        return completado || await eventoYaCompletado(clave);
+      }));
+
+      const pendientes = [];
+      for (let i = 0; i < resultados.length; i++) {
+        const resultado = resultados[i];
+        let completado = resultado.status === 'fulfilled' && resultado.value === true;
+        if (!completado) {
+          try { completado = await eventoYaCompletado(clavesIndividuales[i]); }
+          catch (error) { console.warn(`[NOTIFICACIONES] No se pudo verificar el envío a ${unicos[i].uid}: ${error.message}`); }
+        }
+        if (!completado) pendientes.push(unicos[i].uid);
+        if (resultado.status === 'rejected') {
+          console.warn(`[NOTIFICACIONES] Falló el envío a ${unicos[i].uid}: ${resultado.reason?.message || resultado.reason}`);
+        }
+      }
+
+      if (pendientes.length) {
+        await claim.set({
+          estado: 'pendiente',
+          destinatarios: unicos.length,
+          destinatarios_pendientes: pendientes,
+          ultima_revision_en: FieldValue.serverTimestamp(),
+          procesando_hasta: FieldValue.delete(),
+          ultimo_error: `No se completó la entrega a ${pendientes.length} destinatario(s).`
+        }, { merge: true });
+        console.warn(`[NOTIFICACIONES] Evento ${notification.type || eventKey} incompleto; se reintentará para ${pendientes.length} destinatario(s).`);
+        return false;
+      }
+
+      await claim.set({
+        estado: 'enviado',
+        destinatarios: unicos.length,
+        destinatarios_pendientes: [],
+        envios_exitosos: unicos.length,
+        envios_fallidos: 0,
+        historial_guardado: true,
+        enviado_en: FieldValue.serverTimestamp(),
+        procesando_hasta: FieldValue.delete(),
+        ultimo_error: FieldValue.delete()
+      }, { merge: true });
+      return true;
+    } catch (error) {
+      await claim.set({
+        estado: 'pendiente',
+        ultima_revision_en: FieldValue.serverTimestamp(),
+        procesando_hasta: FieldValue.delete(),
+        ultimo_error: String(error?.message || error).slice(0, 500)
+      }, { merge: true }).catch(() => {});
+      throw error;
+    }
+  }
+
   const claim = await reclamarEvento(eventKey, notification);
   if (!claim) return false;
-
-  let destinatariosFinales = Array.isArray(destinatarios) ? destinatarios : null;
-  let completados = 0;
-  let fallidos = 0;
   try {
-    if (cargarDestinatarios) destinatariosFinales = await destinatarios();
-    if (!Array.isArray(destinatariosFinales) || destinatariosFinales.length === 0) {
-      await liberarEvento(claim);
-      console.warn(`[NOTIFICACIONES] Evento ${notification.type || eventKey} sin usuarios destinatarios.`);
-      return false;
-    }
-
-    for (const usuario of destinatariosFinales) {
-      const userEventKey = `${eventKey}|destinatario|${usuario.uid}`;
-      const userClaim = await reclamarEvento(userEventKey, notification);
-      if (!userClaim) {
-        // Ya se procesó la cuenta en un ciclo anterior; no repetir su push.
-        completados += 1;
-        continue;
-      }
-
-      try {
-        const resultado = await enviarNotificacion([usuario], notification, userEventKey);
-        if (!resultado.successCount) {
-          if (!resultado.tokensDisponibles) {
-            // Aunque no tenga push activo, el aviso ya quedó en el centro de la app.
-            await userClaim.set({
-              envios_exitosos: 0,
-              envios_fallidos: 0,
-              destinatarios: 1,
-              historial_guardado: true,
-              solo_centro: true,
-              enviado_en: FieldValue.serverTimestamp()
-            }, { merge: true });
-            completados += 1;
-            continue;
-          }
-          await liberarEvento(userClaim);
-          fallidos += 1;
-          continue;
-        }
-
-        await userClaim.set({
-          envios_exitosos: resultado.successCount,
-          envios_fallidos: resultado.failureCount,
-          destinatarios: 1,
+    const resultado = await enviarNotificacion(unicos, notification, eventKey);
+    // Sin tokens push sigue siendo una entrega válida al centro de notificaciones.
+    if (!resultado.successCount) {
+      if (!resultado.tokensDisponibles && resultado.erroresCentro === 0) {
+        await claim.set({
+          estado: 'solo_centro',
+          envios_exitosos: 0,
+          envios_fallidos: 0,
+          destinatarios: resultado.destinatarios,
           historial_guardado: true,
-          enviado_en: FieldValue.serverTimestamp()
+          solo_centro: true,
+          enviado_en: FieldValue.serverTimestamp(),
+          procesando_hasta: FieldValue.delete()
         }, { merge: true });
-        completados += 1;
-      } catch (error) {
-        await liberarEvento(userClaim);
-        fallidos += 1;
-        console.warn(`[NOTIFICACIONES] Se reintentará ${notification.type || eventKey} para ${usuario.uid}: ${error.message}`);
+        return true;
       }
-    }
-
-    if (fallidos > 0) {
       await liberarEvento(claim);
-      console.warn(`[NOTIFICACIONES] Evento ${notification.type || eventKey}: ${fallidos} destinatario(s) pendientes de reintento; ${completados} ya procesados.`);
+      console.warn(`[NOTIFICACIONES] Evento ${notification.type || eventKey} sin entrega completada; se reintentará.`);
       return false;
     }
-
     await claim.set({
-      completo: true,
-      envios_exitosos: completados,
-      envios_fallidos: 0,
-      destinatarios: destinatariosFinales.length,
+      estado: 'enviado',
+      envios_exitosos: resultado.successCount,
+      envios_fallidos: resultado.failureCount,
+      destinatarios: resultado.destinatarios,
       historial_guardado: true,
-      enviado_en: FieldValue.serverTimestamp()
+      enviado_en: FieldValue.serverTimestamp(),
+      procesando_hasta: FieldValue.delete(),
+      ultimo_error: FieldValue.delete()
     }, { merge: true });
     return true;
   } catch (error) {
@@ -637,17 +510,8 @@ async function enviarEventoUnico(eventKey, notification, destinatarios) {
 
 async function procesarSuplencias(now, initializedAtMs) {
   const monthKeys = [numeroMesClave(now), mesAnteriorClave(now), mesSiguienteClave(now)];
-  const snapshots = await Promise.all(monthKeys.map(key => obtenerSnapshotHorariosMes(key)));
+  const snapshots = await Promise.all(monthKeys.map(key => db.collection('horarios_servicios').where('mes_anio', '==', key).get()));
   let procesadas = 0;
-  // No consultar perfiles de operadores si esta revisión no tiene solicitudes nuevas.
-  // La promesa se reutiliza si hay varias solicitudes nuevas en una misma ejecución.
-  let destinatariosOperadoresPromise = null;
-  const cargarOperadoresSiHaceFalta = () => {
-    if (!destinatariosOperadoresPromise) {
-      destinatariosOperadoresPromise = obtenerDestinatariosOperadores();
-    }
-    return destinatariosOperadoresPromise;
-  };
 
   for (const snap of snapshots) {
     for (const docSnap of snap.docs) {
@@ -662,16 +526,21 @@ async function procesarSuplencias(now, initializedAtMs) {
 
       for (const miembro of equipo) {
         if (!miembro?.suplencia_solicitada || !miembro?.id_usuario) continue;
-        const eventoMs = toMillis(data.suplencias_solicitadas_en?.[miembro.id_usuario] || miembro.suplencia_solicitada_en);
+        const eventoMs = toMillis(miembro.suplencia_solicitada_en);
         if (eventoMs === null || eventoMs <= initializedAtMs) continue;
 
         const eventKey = `suplencia|${docSnap.id}|${miembro.id_usuario}|${eventoMs}`;
+        const destinatarios = await obtenerTodosDestinatarios(dataUsuario => !!dataUsuario.es_operador);
         const sent = await enviarEventoUnico(eventKey, {
           title: '🔄 Solicitud de suplencia',
           body: `${miembro.nombre || 'Un integrante'} solicita suplencia para ${servicio} — ${fechaTexto}.`,
           type: 'solicitud_suplencia',
-          extra: { horarioId: docSnap.id }
-        }, cargarOperadoresSiHaceFalta);
+          extra: {
+            horarioId: docSnap.id,
+            solicitudId: `${docSnap.id}-${miembro.id_usuario}-${eventoMs}`,
+            integranteUid: miembro.id_usuario
+          }
+        }, destinatarios);
         if (sent) procesadas += 1;
       }
     }
@@ -681,98 +550,51 @@ async function procesarSuplencias(now, initializedAtMs) {
 
 async function procesarCanciones(now, initializedAtMs) {
   const monthKeys = [numeroMesClave(now), mesSiguienteClave(now)];
-  const snapshots = await Promise.all(monthKeys.map(key => obtenerSnapshotHorariosMes(key)));
-  const docsActualizados = snapshots.flatMap(snap => snap.docs).filter(docSnap => {
-    const updatedMs = toMillis(docSnap.data()?.canciones_actualizadas_en);
-    return updatedMs !== null && updatedMs > initializedAtMs;
-  });
+  const snapshots = await Promise.all(monthKeys.map(key => db.collection('horarios_servicios').where('mes_anio', '==', key).get()));
+  const cacheUsuarios = new Map();
   let procesadas = 0;
 
-  for (const docSnap of docsActualizados) {
-    const data = docSnap.data() || {};
-    const updatedMs = toMillis(data.canciones_actualizadas_en);
-    const actorUid = String(data.canciones_actualizadas_por || '').trim();
-    const ids = [...new Set((Array.isArray(data.equipo) ? data.equipo : [])
-      .map(miembro => String(miembro?.id_usuario || '').trim()).filter(Boolean))]
-      .filter(uid => uid !== actorUid);
-    if (!ids.length) continue;
+  async function nombreUsuario(uid) {
+    if (!uid) return 'El director/operador';
+    if (cacheUsuarios.has(uid)) return cacheUsuarios.get(uid);
+    const snap = await db.collection('usuarios').doc(uid).get();
+    const nombre = snap.exists ? (snap.data()?.nombre_completo || 'El director/operador') : 'El director/operador';
+    cacheUsuarios.set(uid, nombre);
+    return nombre;
+  }
 
-    const info = parseMesAnio(data.mes_anio);
-    const dia = Number(data.dia);
-    const fechaServicio = info && Number.isInteger(dia)
-      ? DateTime.fromObject({ year: info.anio, month: info.mes, day: dia }, { zone: APP_TIMEZONE })
-      : null;
-    const fechaTexto = fechaServicio?.isValid ? formatoFecha(fechaServicio) : `día ${dia}`;
-    const notification = {
-      title: '🎶 Repertorio actualizado',
-      // El cuerpo se completa dentro del cargador, después de reservar el evento.
-      body: `El director/operador actualizó las canciones para ${data.descripcion_servicio || 'el servicio'} — ${fechaTexto}.`,
-      type: 'canciones_actualizadas',
-      extra: { horarioId: docSnap.id }
-    };
-    const eventKey = `canciones|${docSnap.id}|${updatedMs}`;
-    const cargarDestinatarios = async () => {
-      const [nombres, destinatarios] = await Promise.all([
-        obtenerNombresUsuarios(actorUid ? [actorUid] : []),
-        obtenerDestinatarios(ids)
-      ]);
-      const actor = nombres.get(actorUid) || 'El director/operador';
-      notification.body = `${actor} actualizó las canciones para ${data.descripcion_servicio || 'el servicio'} — ${fechaTexto}.`;
-      return destinatarios;
-    };
+  for (const snap of snapshots) {
+    for (const docSnap of snap.docs) {
+      const data = docSnap.data() || {};
+      const updatedMs = toMillis(data.canciones_actualizadas_en);
+      const actorUid = data.canciones_actualizadas_por || '';
+      if (updatedMs === null || updatedMs <= initializedAtMs) continue;
+      const equipo = Array.isArray(data.equipo) ? data.equipo : [];
+      const ids = equipo.map(m => m?.id_usuario).filter(Boolean);
+      if (!ids.length) continue;
 
-    const sent = await enviarEventoUnico(eventKey, notification, cargarDestinatarios);
-    if (sent) procesadas += 1;
+      const info = parseMesAnio(data.mes_anio);
+      const dia = Number(data.dia);
+      const fechaServicio = info && Number.isInteger(dia)
+        ? DateTime.fromObject({ year: info.anio, month: info.mes, day: dia }, { zone: APP_TIMEZONE })
+        : null;
+      const fechaTexto = fechaServicio?.isValid ? formatoFecha(fechaServicio) : `día ${dia}`;
+      const actor = await nombreUsuario(actorUid);
+      const destinatarios = await obtenerDestinatarios(ids, actorUid);
+      const eventKey = `canciones|${docSnap.id}|${updatedMs}`;
+
+      const sent = await enviarEventoUnico(eventKey, {
+        title: '🎶 Repertorio actualizado',
+        body: `${actor} actualizó las canciones para ${data.descripcion_servicio || 'el servicio'} — ${fechaTexto}.`,
+        type: 'canciones_actualizadas',
+        extra: { horarioId: docSnap.id, recordatorioId: `${docSnap.id}-${updatedMs}` }
+      }, destinatarios);
+      if (sent) procesadas += 1;
+    }
   }
   return procesadas;
 }
 
-async function procesarNotas(now, initializedAtMs) {
-  const monthKeys = [numeroMesClave(now), mesSiguienteClave(now)];
-  const snapshots = await Promise.all(monthKeys.map(key => obtenerSnapshotHorariosMes(key)));
-  const docsActualizados = snapshots.flatMap(snap => snap.docs).filter(docSnap => {
-    const updatedMs = toMillis(docSnap.data()?.notas_actualizadas_en);
-    return updatedMs !== null && updatedMs > initializedAtMs;
-  });
-  let procesadas = 0;
-
-  for (const docSnap of docsActualizados) {
-    const data = docSnap.data() || {};
-    const updatedMs = toMillis(data.notas_actualizadas_en);
-    const actorUid = String(data.notas_actualizadas_por || '').trim();
-    const ids = [...new Set((Array.isArray(data.equipo) ? data.equipo : [])
-      .map(miembro => String(miembro?.id_usuario || '').trim()).filter(Boolean))]
-      .filter(uid => uid !== actorUid);
-    if (!ids.length) continue;
-
-    const info = parseMesAnio(data.mes_anio);
-    const dia = Number(data.dia);
-    const fechaServicio = info && Number.isInteger(dia)
-      ? DateTime.fromObject({ year: info.anio, month: info.mes, day: dia }, { zone: APP_TIMEZONE })
-      : null;
-    const fechaTexto = fechaServicio?.isValid ? formatoFecha(fechaServicio) : `día ${dia}`;
-    const notification = {
-      title: '📝 Notas de arreglo actualizadas',
-      body: `El director/operador actualizó las notas para ${data.descripcion_servicio || 'el servicio'} — ${fechaTexto}.`,
-      type: 'notas_actualizadas',
-      extra: { horarioId: docSnap.id }
-    };
-    const eventKey = `notas_arreglo|${docSnap.id}|${updatedMs}`;
-    const cargarDestinatarios = async () => {
-      const [nombres, destinatarios] = await Promise.all([
-        obtenerNombresUsuarios(actorUid ? [actorUid] : []),
-        obtenerDestinatarios(ids)
-      ]);
-      const actor = nombres.get(actorUid) || 'El director/operador';
-      notification.body = `${actor} actualizó las notas para ${data.descripcion_servicio || 'el servicio'} — ${fechaTexto}.`;
-      return destinatarios;
-    };
-
-    const sent = await enviarEventoUnico(eventKey, notification, cargarDestinatarios);
-    if (sent) procesadas += 1;
-  }
-  return procesadas;
-}
 
 function momentosAvisoCalendario(fechaEvento, now) {
   if (!fechaEvento || !fechaEvento.isValid || !now || !now.isValid) return [];
@@ -798,7 +620,7 @@ function momentosAvisoCalendario(fechaEvento, now) {
 }
 
 async function obtenerMesesConHorariosVisibles() {
-  const snap = await obtenerSnapshotPublicacionesVisibles();
+  const snap = await db.collection('publicaciones_horarios').where('visible', '==', true).get();
   return new Set(snap.docs.map(docSnap => {
     const data = docSnap.data() || {};
     return String(data.mes_anio || docSnap.id);
@@ -808,7 +630,7 @@ async function obtenerMesesConHorariosVisibles() {
 async function procesarAsignaciones(now) {
   const monthKeys = [numeroMesClave(now), mesSiguienteClave(now)];
   const [snapshots, mesesVisibles] = await Promise.all([
-    Promise.all(monthKeys.map(key => obtenerSnapshotHorariosMes(key))),
+    Promise.all(monthKeys.map(key => db.collection('horarios_servicios').where('mes_anio', '==', key).get())),
     obtenerMesesConHorariosVisibles()
   ]);
   let procesadas = 0;
@@ -854,13 +676,14 @@ async function procesarAsignaciones(now) {
             : 'asignacion_mismo_dia';
 
         for (const uid of ids) {
+          const destinatarios = await obtenerDestinatarios([uid]);
           const eventKey = `asignacion_recordatorio|${docSnap.id}|${uid}|${fechaServicio.toISODate()}|${modo}`;
           const sent = await enviarEventoUnico(eventKey, {
             title,
             body,
             type: tipo,
             extra: { horarioId: docSnap.id, uid, fechaServicio: fechaServicio.toISODate(), momento: modo }
-          }, () => obtenerDestinatarios([uid]));
+          }, destinatarios);
           if (sent) procesadas += 1;
         }
       }
@@ -872,7 +695,7 @@ async function procesarAsignaciones(now) {
 
 async function procesarAsignacionesOracion(now) {
   const monthKeys = [numeroMesClave(now), mesSiguienteClave(now)];
-  const snapshots = await Promise.all(monthKeys.map(key => db.collection('asignaciones_oracion').where('mes_anio', '==', key).limit(1000).get()));
+  const snapshots = await Promise.all(monthKeys.map(key => db.collection('asignaciones_oracion').where('mes_anio', '==', key).get()));
   let procesadas = 0;
 
   for (const snap of snapshots) {
@@ -895,13 +718,14 @@ async function procesarAsignacionesOracion(now) {
           : modo === 'dia_anterior'
             ? 'oracion_dia_anterior'
             : 'oracion_mismo_dia';
+        const destinatarios = await obtenerDestinatarios([uid]);
         const eventKey = `oracion_recordatorio|${docSnap.id}|${uid}|${fechaTextoISO}|${modo}`;
         const sent = await enviarEventoUnico(eventKey, {
           title: esDiaAnterior ? '🎙️ Mañana te corresponde la oración' : '🎙️ Hoy te corresponde la oración',
           body: `${esDiaAnterior ? 'Mañana' : 'Hoy'} te corresponde enviar el audio de oración al grupo (${fechaLegible}).`,
           type: tipo,
           extra: { oracionId: docSnap.id, uid, fecha: fechaTextoISO, momento: modo }
-        }, () => obtenerDestinatarios([uid]));
+        }, destinatarios);
         if (sent) procesadas += 1;
       }
     }
@@ -911,20 +735,10 @@ async function procesarAsignacionesOracion(now) {
 
 async function procesarEnsayos(now) {
   const monthKeys = [numeroMesClave(now), mesSiguienteClave(now)];
-  const [snapshots, mesesVisibles, horariosSnapshots] = await Promise.all([
-    Promise.all(monthKeys.map(key => db.collection('ensayos_servicios').where('mes_anio', '==', key).limit(1000).get())),
-    obtenerMesesConHorariosVisibles(),
-    Promise.all(monthKeys.map(key => obtenerSnapshotHorariosMes(key)))
+  const [snapshots, mesesVisibles] = await Promise.all([
+    Promise.all(monthKeys.map(key => db.collection('ensayos_servicios').where('mes_anio', '==', key).get())),
+    obtenerMesesConHorariosVisibles()
   ]);
-  const horariosPorMesDia = new Map();
-  for (const scheduleSnap of horariosSnapshots) {
-    for (const scheduleDoc of scheduleSnap.docs) {
-      const scheduleData = scheduleDoc.data() || {};
-      const key = `${scheduleData.mes_anio}|${Number(scheduleData.dia)}`;
-      if (!horariosPorMesDia.has(key)) horariosPorMesDia.set(key, []);
-      horariosPorMesDia.get(key).push(scheduleDoc);
-    }
-  }
   let procesadas = 0;
 
   for (const snap of snapshots) {
@@ -933,19 +747,28 @@ async function procesarEnsayos(now) {
       // Los ensayos solo generan recordatorios una vez visibles los horarios del mes.
       if (!mesesVisibles.has(String(data.mes_anio || ''))) continue;
       const ensayoDt = fechaEnsayo(data);
-      if (!ensayoDt || ensayoDt < now.startOf('day') || ensayoDt > now.plus({ months: 2 })) continue;
+      // No enviar recordatorios atrasados después de que el ensayo ya comenzó.
+      if (!ensayoDt || ensayoDt <= now || ensayoDt > now.plus({ months: 2 })) continue;
 
       const serviceKey = data.dia_servicio;
-      const schedulesForDay = horariosPorMesDia.get(`${data.mes_anio}|${Number(serviceKey)}`) || [];
-      if (!schedulesForDay.length) continue;
+      const serviceSnap = await db.collection('horarios_servicios')
+        .where('mes_anio', '==', data.mes_anio)
+        .where('dia', '==', Number(serviceKey))
+        .get();
+      if (serviceSnap.empty) continue;
 
-      // Se busca en los horarios del mes cargados una sola vez. Si hay varios
-      // servicios, el ensayo solo se vincula por nombre cuando la coincidencia es inequívoca.
+      // Si hay varios servicios el mismo día, asociar el ensayo al servicio
+      // indicado en el propio documento. No avisar a un equipo ajeno por usar
+      // arbitrariamente el primer horario de esa fecha.
       const nombreServicioEsperado = String(data.nombre_servicio || '').trim().toLocaleLowerCase('es');
-      const horarioCoincidente = nombreServicioEsperado
-        ? schedulesForDay.find(schedule => String(schedule.data()?.descripcion_servicio || '').trim().toLocaleLowerCase('es') === nombreServicioEsperado)
-        : null;
-      const horario = horarioCoincidente || (schedulesForDay.length === 1 ? schedulesForDay[0] : null);
+      const horariosCoincidentes = nombreServicioEsperado
+        ? serviceSnap.docs.filter(doc => String(doc.data()?.descripcion_servicio || '').trim().toLocaleLowerCase('es') === nombreServicioEsperado)
+        : [];
+      const horario = horariosCoincidentes.length === 1
+        ? horariosCoincidentes[0]
+        : (!nombreServicioEsperado && serviceSnap.size === 1 ? serviceSnap.docs[0] : null);
+      // Un nombre repetido o un nombre no coincidente entre varios servicios
+      // no identifica al equipo con seguridad; en ese caso no avisar al azar.
       if (!horario) {
         console.warn(`[NOTIFICACIONES] No se pudo identificar el servicio correcto para el ensayo ${docSnap.id}; no se enviará a un equipo ambiguo.`);
         continue;
@@ -980,13 +803,14 @@ async function procesarEnsayos(now) {
             : 'aviso_ensayo_mismo_dia';
 
         for (const uid of ids) {
-          const eventKey = `ensayo_recordatorio|${data.mes_anio}|${serviceKey}|${data.dia_ensayo}|${data.hora_ensayo}|${uid}|${modo}`;
+          const destinatarios = await obtenerDestinatarios([uid]);
+          const eventKey = `ensayo_recordatorio|${docSnap.id}|${uid}|${modo}`;
           const sent = await enviarEventoUnico(eventKey, {
             title,
             body,
             type: tipo,
             extra: { horarioId: horario.id, ensayoId: docSnap.id, uid, momento: modo }
-          }, () => obtenerDestinatarios([uid]));
+          }, destinatarios);
           if (sent) procesadas += 1;
         }
       }
@@ -995,12 +819,140 @@ async function procesarEnsayos(now) {
   return procesadas;
 }
 
-async function procesarPublicacionHorarios() {
-  const snap = await obtenerSnapshotPublicacionesVisibles();
-  if (snap.empty) return 0;
-  const cargarDestinatariosPublicacion = () => obtenerTodosDestinatarios();
-  const estadosPublicacion = await obtenerSnapshotsPorLotes(snap.docs.map(docSnap => docSnap.ref));
-  const estadosPorId = new Map(estadosPublicacion.map(snapshot => [snapshot.id, snapshot]));
+async function procesarRecordatoriosManuales(now) {
+  // Leer todas las solicitudes pendientes evita que una tanda antigua con errores
+  // deje solicitudes más recientes esperando indefinidamente detrás del límite.
+  const solicitudesSnap = await db.collection('solicitudes_recordatorio_horario')
+    .where('estado', '==', 'pendiente')
+    .get();
+  let procesadas = 0;
+
+  for (const solicitudSnap of solicitudesSnap.docs) {
+    const solicitud = solicitudSnap.data() || {};
+    const solicitudRef = solicitudSnap.ref;
+    const horarioId = String(solicitud.horario_id || '').trim();
+    try {
+      if (!horarioId) {
+        await solicitudRef.update({
+          estado: 'error',
+          error: 'La solicitud no contiene horario_id.',
+          procesado_en: FieldValue.serverTimestamp()
+        });
+        continue;
+      }
+
+      const horarioSnap = await db.collection('horarios_servicios').doc(horarioId).get();
+      if (!horarioSnap.exists) {
+        await solicitudRef.update({
+          estado: 'error',
+          error: 'El horario solicitado ya no existe.',
+          procesado_en: FieldValue.serverTimestamp()
+        });
+        continue;
+      }
+
+      const horario = horarioSnap.data() || {};
+      const info = parseMesAnio(horario.mes_anio);
+      const dia = Number(horario.dia);
+      if (!info || !Number.isInteger(dia)) {
+        await solicitudRef.update({
+          estado: 'error',
+          error: 'El horario tiene una fecha inválida.',
+          procesado_en: FieldValue.serverTimestamp()
+        });
+        continue;
+      }
+      const fechaServicio = DateTime.fromObject({ year: info.anio, month: info.mes, day: dia }, { zone: APP_TIMEZONE }).startOf('day');
+      if (!fechaServicio.isValid) {
+        await solicitudRef.update({
+          estado: 'error',
+          error: 'No se pudo interpretar la fecha del servicio.',
+          procesado_en: FieldValue.serverTimestamp()
+        });
+        continue;
+      }
+      if (fechaServicio < now.startOf('day')) {
+        await solicitudRef.update({
+          estado: 'expirado',
+          error: 'El servicio ya pasó; no se envió un recordatorio atrasado.',
+          procesado_en: FieldValue.serverTimestamp()
+        });
+        continue;
+      }
+
+      const ids = [...new Set((Array.isArray(horario.equipo) ? horario.equipo : [])
+        .map(miembro => miembro?.id_usuario)
+        .filter(Boolean))];
+      if (!ids.length) {
+        await solicitudRef.update({
+          estado: 'sin_destinatarios',
+          error: 'El horario no tiene integrantes asignados.',
+          procesado_en: FieldValue.serverTimestamp()
+        });
+        continue;
+      }
+      const destinatarios = await obtenerDestinatarios(ids);
+      if (!destinatarios.length) {
+        await solicitudRef.update({
+          estado: 'sin_destinatarios',
+          error: 'No se encontraron perfiles para los integrantes asignados.',
+          procesado_en: FieldValue.serverTimestamp()
+        });
+        continue;
+      }
+
+      const fechaTexto = formatoFecha(fechaServicio);
+      const servicio = String(horario.descripcion_servicio || 'el servicio');
+      const eventKey = `recordatorio_manual_horario|${solicitudSnap.id}|${horarioId}`;
+      const notification = {
+        title: '🔔 Recordatorio del servicio',
+        body: `Recuerda que estás asignado a ${servicio} el ${fechaTexto}. Entra en Oasis App para consultar los detalles de tu horario.`,
+        type: 'recordatorio_servicio_manual',
+        extra: {
+          horarioId,
+          recordatorioId: solicitudSnap.id,
+          solicitudId: solicitudSnap.id,
+          mes_anio: String(horario.mes_anio || ''),
+          dia: String(dia)
+        }
+      };
+
+      const enviado = await enviarEventoUnico(eventKey, notification, destinatarios);
+      const completado = enviado || await eventoYaCompletado(eventKey);
+      if (completado) {
+        await solicitudRef.update({
+          estado: 'enviado',
+          destinatarios: destinatarios.length,
+          error: FieldValue.delete(),
+          procesado_en: FieldValue.serverTimestamp(),
+          ultimo_intento_en: FieldValue.serverTimestamp()
+        });
+        procesadas += 1;
+      } else {
+        await solicitudRef.update({
+          estado: 'pendiente',
+          intentos: FieldValue.increment(1),
+          ultimo_error: 'La entrega no se completó; se volverá a intentar automáticamente.',
+          ultimo_intento_en: FieldValue.serverTimestamp()
+        });
+      }
+    } catch (error) {
+      console.error(`[NOTIFICACIONES] No se pudo procesar el recordatorio manual ${solicitudSnap.id}:`, error);
+      await solicitudRef.update({
+        estado: 'pendiente',
+        intentos: FieldValue.increment(1),
+        ultimo_error: String(error?.message || error).slice(0, 500),
+        ultimo_intento_en: FieldValue.serverTimestamp()
+      }).catch(updateError => {
+        console.warn(`[NOTIFICACIONES] No se pudo guardar el estado de la solicitud ${solicitudSnap.id}: ${updateError.message}`);
+      });
+    }
+  }
+  return procesadas;
+}
+
+async function procesarPublicacionHorarios(initializedAtMs) {
+  const snap = await db.collection('publicaciones_horarios').where('visible', '==', true).get();
   let procesadas = 0;
 
   for (const docSnap of snap.docs) {
@@ -1011,24 +963,28 @@ async function procesarPublicacionHorarios() {
       console.warn(`[NOTIFICACIONES] Publicación ${mesClave} visible sin visible_en; no se enviará un aviso duplicable.`);
       continue;
     }
+    // En la primera ejecución, no convertir publicaciones ya antiguas en avisos
+    // nuevos. Solo se notifica cuando la fecha de publicación es posterior a la línea base.
+    if (visibleMs <= initializedAtMs) continue;
 
     // Releer justo antes de enviar: si un operador ocultó el mes después de la
     // consulta inicial, no se anuncia como visible.
-    const estadoActual = estadosPorId.get(docSnap.id);
-    const estadoActualData = estadoActual?.data() || {};
-    if (!estadoActual?.exists || estadoActualData.visible !== true || toMillis(estadoActualData.visible_en) !== visibleMs) continue;
+    const estadoActual = await docSnap.ref.get();
+    const estadoActualData = estadoActual.data() || {};
+    if (!estadoActual.exists || estadoActualData.visible !== true || toMillis(estadoActualData.visible_en) !== visibleMs) continue;
 
     const info = parseMesAnio(mesClave);
     const mesTexto = info
       ? DateTime.fromObject({ year: info.anio, month: info.mes, day: 1 }, { zone: APP_TIMEZONE }).setLocale('es').toFormat("LLLL 'de' yyyy")
       : mesClave;
     const eventKey = `horarios_visibles|${mesClave}|${visibleMs}`;
+    const destinatarios = await obtenerTodosDestinatarios();
     const sent = await enviarEventoUnico(eventKey, {
       title: '📅 ¡Los horarios ya están visibles!',
       body: `Los horarios de ${mesTexto} ya están visibles. Entra en Oasis App para consultar tus asignaciones y ensayos.`,
       type: 'horarios_visibles',
       extra: { mes_anio: mesClave, publicacionId: `${mesClave}-${visibleMs}` }
-    }, cargarDestinatariosPublicacion);
+    }, destinatarios);
     if (sent) procesadas += 1;
   }
   return procesadas;
@@ -1041,65 +997,25 @@ async function procesarAperturaMesSiguiente(now, initializedAtMs) {
   const data = snap.data() || {};
   const nextMonth = now.plus({ months: 1 });
   const nextMonthKey = numeroMesClave(nextMonth);
-  const targetMonthKey = /^\d{1,2}-\d{4}$/.test(String(data.siguiente_mes_abierto_para || ''))
-    ? String(data.siguiente_mes_abierto_para)
-    : nextMonthKey;
-  const plazoProgramado = data.plazos_disponibilidad && data.plazos_disponibilidad[targetMonthKey];
+  const plazoProgramado = data.plazos_disponibilidad && data.plazos_disponibilidad[nextMonthKey];
   const inicioPlazo = String(plazoProgramado?.inicio || '');
   const limitePlazo = String(plazoProgramado?.limite || '');
   if (/^\d{4}-\d{2}-\d{2}$/.test(inicioPlazo)
       && /^\d{4}-\d{2}-\d{2}$/.test(limitePlazo)
       && inicioPlazo <= limitePlazo) return 0;
-  if (!data.siguiente_mes_abierto) return 0;
+  if (!data.siguiente_mes_abierto || String(data.siguiente_mes_abierto_para || '') !== nextMonthKey) return 0;
 
   const openedMs = toMillis(data.siguiente_mes_abierto_en);
   if (openedMs === null || openedMs <= initializedAtMs) return 0;
-  const targetMonthInfo = parseMesAnio(targetMonthKey);
-  if (!targetMonthInfo) return 0;
-  const targetMonth = DateTime.fromObject({ year: targetMonthInfo.anio, month: targetMonthInfo.mes, day: 1 }, { zone: APP_TIMEZONE });
-  if (!targetMonth.isValid) return 0;
 
-  const eventKey = `disponibilidad_mes_siguiente|${targetMonthKey}|${openedMs}`;
-  const cargarDestinatarios = () => obtenerTodosDestinatarios();
+  const eventKey = `disponibilidad_mes_siguiente|${nextMonthKey}|${openedMs}`;
+  const destinatarios = await obtenerTodosDestinatarios();
   const sent = await enviarEventoUnico(eventKey, {
     title: '🗓️ Disponibilidades abiertas',
-    body: `Ya puedes llenar tu disponibilidad para ${targetMonth.setLocale('es').toFormat("LLLL 'de' yyyy")}.`,
+    body: `Ya puedes llenar tu disponibilidad para ${nextMonth.setLocale('es').toFormat("LLLL 'de' yyyy")}.`,
     type: 'disponibilidad_mes_siguiente_abierta',
-    extra: { mes_anio: targetMonthKey }
-  }, cargarDestinatarios);
-  return sent ? 1 : 0;
-}
-
-async function procesarCierreMesSiguiente(now, initializedAtMs) {
-  const snap = await db.collection('configuracion').doc('general').get();
-  if (!snap.exists) return 0;
-  const data = snap.data() || {};
-  if (data.siguiente_mes_abierto !== false) return 0;
-
-  const closedMs = toMillis(data.siguiente_mes_cerrado_en);
-  if (closedMs === null || closedMs <= initializedAtMs) return 0;
-  const targetMonthKey = /^\d{1,2}-\d{4}$/.test(String(data.siguiente_mes_cerrado_para || ''))
-    ? String(data.siguiente_mes_cerrado_para)
-    : mesSiguienteClave(now);
-  const plazoProgramado = data.plazos_disponibilidad && data.plazos_disponibilidad[targetMonthKey];
-  const inicioPlazo = String(plazoProgramado?.inicio || '');
-  const limitePlazo = String(plazoProgramado?.limite || '');
-  if (/^\d{4}-\d{2}-\d{2}$/.test(inicioPlazo)
-      && /^\d{4}-\d{2}-\d{2}$/.test(limitePlazo)
-      && inicioPlazo <= limitePlazo) return 0;
-
-  const info = parseMesAnio(targetMonthKey);
-  if (!info) return 0;
-  const targetMonth = DateTime.fromObject({ year: info.anio, month: info.mes, day: 1 }, { zone: APP_TIMEZONE });
-  if (!targetMonth.isValid) return 0;
-  const eventKey = `disponibilidad_mes_siguiente_cerrada|${targetMonthKey}|${closedMs}`;
-  const cargarDestinatarios = () => obtenerTodosDestinatarios();
-  const sent = await enviarEventoUnico(eventKey, {
-    title: '⛔ Disponibilidades cerradas',
-    body: `Se cerró la disponibilidad para ${targetMonth.setLocale('es').toFormat("LLLL 'de' yyyy")}. Ya no se pueden registrar cambios por la vía normal.`,
-    type: 'disponibilidad_mes_siguiente_cerrada',
-    extra: { mes_anio: targetMonthKey }
-  }, cargarDestinatarios);
+    extra: { mes_anio: nextMonthKey }
+  }, destinatarios);
   return sent ? 1 : 0;
 }
 
@@ -1111,7 +1027,6 @@ async function procesarAvisosPlazoDisponibilidad(now) {
 
   const hoy = now.toISODate();
   let procesadas = 0;
-  const cargarDestinatariosPlazos = () => obtenerTodosDestinatarios();
   for (const [mesClave, plazo] of Object.entries(plazos)) {
     const inicioTexto = String(plazo?.inicio || '');
     const limiteTexto = String(plazo?.limite || '');
@@ -1168,128 +1083,14 @@ async function procesarAvisosPlazoDisponibilidad(now) {
       if (aviso.momento === 'apertura' ? !esAperturaDentroDelPlazo : hoy !== aviso.fecha) continue;
 
       const eventKey = `disponibilidad_plazo|${mesClave}|${aviso.momento}|${inicioTexto}|${limiteTexto}`;
+      const destinatarios = await obtenerTodosDestinatarios();
       const sent = await enviarEventoUnico(eventKey, {
         title: aviso.title,
         body: aviso.body,
         type: aviso.type,
         extra: { mes_anio: mesClave, fecha_inicio: inicioTexto, fecha_limite: limiteTexto }
-      }, cargarDestinatariosPlazos);
+      }, destinatarios);
       if (sent) procesadas += 1;
-    }
-  }
-  return procesadas;
-}
-
-async function actualizarEstadoSolicitud(ref, estado, campos = {}) {
-  await ref.set({
-    estado,
-    actualizado_en: FieldValue.serverTimestamp(),
-    ...campos
-  }, { merge: true });
-}
-
-async function registrarFalloSolicitud(ref, data, error) {
-  const intentos = Number(data.intentos || 0) + 1;
-  const maxIntentos = 8;
-  const estado = intentos >= maxIntentos ? 'fallido' : 'pendiente';
-  await actualizarEstadoSolicitud(ref, estado, {
-    intentos,
-    ultimo_error: String(error?.message || error || 'Error desconocido').slice(0, 500)
-  }).catch(updateError => console.error('[NOTIFICACIONES] No se pudo actualizar el estado de la solicitud:', updateError.message));
-  console.error(`[NOTIFICACIONES] Solicitud ${ref.id} falló en el intento ${intentos}:`, error?.message || error);
-}
-
-async function obtenerEventoRegistrado(eventKey) {
-  const snap = await db.collection('notificaciones_enviadas').doc(hashEventKey(eventKey)).get();
-  if (!snap.exists) return null;
-  const data = snap.data() || {};
-  return eventoCompletado(data) ? data : null;
-}
-
-async function procesarRecordatoriosManuales(now) {
-  const snap = await db.collection('solicitudes_recordatorio_horario').where('estado', '==', 'pendiente').limit(500).get();
-  if (snap.empty) return 0;
-
-  const solicitudes = snap.docs;
-  const idsUsuarios = [...new Set(solicitudes.map(docSnap => String(docSnap.data()?.requested_by || '').trim()).filter(Boolean))];
-  const idsHorarios = [...new Set(solicitudes.map(docSnap => String(docSnap.data()?.horario_id || '').trim()).filter(Boolean))];
-  const [usuariosPorId, horariosDocs] = await Promise.all([
-    obtenerPerfilesUsuariosEnEjecucion(idsUsuarios),
-    obtenerSnapshotsPorLotes(idsHorarios.map(horarioId => db.collection('horarios_servicios').doc(horarioId)))
-  ]);
-  const horariosPorId = new Map(horariosDocs.map(docSnap => [docSnap.id, docSnap]));
-  const meses = [...new Set(horariosDocs.filter(docSnap => docSnap.exists)
-    .map(docSnap => String(docSnap.data()?.mes_anio || '')).filter(Boolean))];
-  const publicacionesDocs = await obtenerSnapshotsPorLotes(meses.map(mesClave => db.collection('publicaciones_horarios').doc(mesClave)));
-  const publicacionesPorMes = new Map(publicacionesDocs.map(docSnap => [docSnap.id, docSnap]));
-
-  let procesadas = 0;
-  for (const solicitud of solicitudes) {
-    const data = solicitud.data() || {};
-    try {
-      const requestedBy = String(data.requested_by || '').trim();
-      const horarioId = String(data.horario_id || '').trim();
-      if (!requestedBy || !horarioId) {
-        await actualizarEstadoSolicitud(solicitud.ref, 'rechazado', { motivo: 'Faltan datos del recordatorio.' });
-        continue;
-      }
-
-      const operador = usuariosPorId.get(requestedBy);
-      if (!operador || operador.es_operador !== true) {
-        await actualizarEstadoSolicitud(solicitud.ref, 'rechazado', { motivo: 'Solo un operador puede solicitar recordatorios manuales.' });
-        continue;
-      }
-      const horarioSnap = horariosPorId.get(horarioId);
-      if (!horarioSnap?.exists) {
-        await actualizarEstadoSolicitud(solicitud.ref, 'rechazado', { motivo: 'El servicio ya no existe.' });
-        continue;
-      }
-      const horario = horarioSnap.data() || {};
-      const mesClave = String(horario.mes_anio || '');
-      const publicacionSnap = publicacionesPorMes.get(mesClave);
-      if (!publicacionSnap?.exists || publicacionSnap.data()?.visible !== true) {
-        await actualizarEstadoSolicitud(solicitud.ref, 'rechazado', { motivo: 'El horario no está publicado.' });
-        continue;
-      }
-
-      const ids = [...new Set((Array.isArray(horario.equipo) ? horario.equipo : [])
-        .map(miembro => String(miembro?.id_usuario || '').trim()).filter(Boolean))];
-      if (!ids.length) {
-        await actualizarEstadoSolicitud(solicitud.ref, 'sin_destinatarios', { destinatarios: 0 });
-        continue;
-      }
-
-      const info = parseMesAnio(mesClave);
-      const dia = Number(horario.dia);
-      const fechaServicio = info && Number.isInteger(dia)
-        ? DateTime.fromObject({ year: info.anio, month: info.mes, day: dia }, { zone: APP_TIMEZONE })
-        : null;
-      const fechaTexto = fechaServicio?.isValid ? formatoFecha(fechaServicio) : 'la fecha del servicio';
-      const eventKey = `recordatorio_manual_horario|${solicitud.id}`;
-      let destinatariosCargados = null;
-      const cargarDestinatarios = async () => {
-        destinatariosCargados = await obtenerDestinatarios(ids);
-        return destinatariosCargados;
-      };
-      const sent = await enviarEventoUnico(eventKey, {
-        title: '🔔 Recordatorio de servicio',
-        body: `Recuerda tu asignación para «${horario.descripcion_servicio || 'el servicio'}» — ${fechaTexto}. Consulta tu horario y el repertorio en A.S.A.F.`,
-        type: 'recordatorio_manual_servicio',
-        extra: { horarioId, recordatorioId: solicitud.id, mes_anio: mesClave, dia: String(horario.dia || '') }
-      }, cargarDestinatarios);
-
-      const eventoPrevio = sent ? null : await obtenerEventoRegistrado(eventKey);
-      if (sent || eventoPrevio) {
-        const cantidadDestinatarios = destinatariosCargados?.length
-          ?? Number(eventoPrevio?.destinatarios || ids.length);
-        await actualizarEstadoSolicitud(solicitud.ref, 'enviado', {
-          destinatarios: cantidadDestinatarios,
-          enviado_en: FieldValue.serverTimestamp()
-        });
-        procesadas += 1;
-      }
-    } catch (error) {
-      await registrarFalloSolicitud(solicitud.ref, data, error);
     }
   }
   return procesadas;
@@ -1298,10 +1099,6 @@ async function procesarRecordatoriosManuales(now) {
 async function ejecutarRevision() {
   if (cronEnCurso) return;
   cronEnCurso = true;
-  destinatariosTodosPromise = null;
-  perfilesUsuariosPromises = new Map();
-  snapshotsHorariosPorMes = new Map();
-  publicacionesVisiblesPromise = null;
   const inicio = DateTime.now().setZone(APP_TIMEZONE);
 
   try {
@@ -1322,14 +1119,12 @@ async function ejecutarRevision() {
     const resultados = await Promise.allSettled([
       procesarSuplencias(inicio, initializedAtMs),
       procesarCanciones(inicio, initializedAtMs),
-      procesarNotas(inicio, initializedAtMs),
       procesarAsignaciones(inicio),
       procesarAsignacionesOracion(inicio),
       procesarEnsayos(inicio),
       procesarRecordatoriosManuales(inicio),
       procesarAperturaMesSiguiente(inicio, initializedAtMs),
-      procesarCierreMesSiguiente(inicio, initializedAtMs),
-      procesarPublicacionHorarios(),
+      procesarPublicacionHorarios(initializedAtMs),
       procesarAvisosPlazoDisponibilidad(inicio)
     ]);
     const errores = resultados.filter(resultado => resultado.status === 'rejected');
@@ -1339,10 +1134,10 @@ async function ejecutarRevision() {
         `${errores.length} proceso(s) de notificación fallaron.`
       );
     }
-    const [suplencias, canciones, notas, asignaciones, oraciones, ensayos, recordatoriosManuales, aperturaMes, cierreMes, publicacionHorarios, plazosDisponibilidad] = resultados.map(resultado => resultado.value);
+    const [suplencias, canciones, asignaciones, oraciones, ensayos, recordatoriosManuales, aperturaMes, publicacionHorarios, plazosDisponibilidad] = resultados.map(resultado => resultado.value);
 
     await actualizarUltimaRevision(estado.ref);
-    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} notas=${notas} asignaciones=${asignaciones} oraciones=${oraciones} ensayos=${ensayos} recordatoriosManuales=${recordatoriosManuales} aperturaMes=${aperturaMes} cierreMes=${cierreMes} publicacionHorarios=${publicacionHorarios} avisosPlazo=${plazosDisponibilidad}`);
+    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} asignaciones=${asignaciones} oraciones=${oraciones} ensayos=${ensayos} recordatoriosManuales=${recordatoriosManuales} aperturaMes=${aperturaMes} publicacionHorarios=${publicacionHorarios} avisosPlazo=${plazosDisponibilidad}`);
   } catch (error) {
     console.error('[NOTIFICACIONES] Error durante la revisión:', error);
     // En GitHub Actions --once debe devolver un código distinto de cero si

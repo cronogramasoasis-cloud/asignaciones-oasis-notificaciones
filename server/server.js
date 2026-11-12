@@ -18,10 +18,10 @@ const RUN_ONCE = process.env.RUN_ONCE === 'true' || process.argv.includes('--onc
 
 const DAY_BEFORE_NOON_HOUR = Number(process.env.AVISO_DIA_ANTERIOR_MEDIODIA_HORA ?? 12);
 const DAY_BEFORE_NOON_MINUTE = Number(process.env.AVISO_DIA_ANTERIOR_MEDIODIA_MINUTO ?? 0);
-const DAY_BEFORE_HOUR = Number(process.env.ENSAYO_AVISO_DIA_ANTERIOR_HORA ?? 18);
-const DAY_BEFORE_MINUTE = Number(process.env.ENSAYO_AVISO_DIA_ANTERIOR_MINUTO ?? 0);
-const SAME_DAY_HOUR = Number(process.env.ENSAYO_AVISO_MISMO_DIA_HORA ?? 8);
-const SAME_DAY_MINUTE = Number(process.env.ENSAYO_AVISO_MISMO_DIA_MINUTO ?? 0);
+const DAY_BEFORE_HOUR = Number(process.env.AVISO_DIA_ANTERIOR_HORA ?? process.env.ENSAYO_AVISO_DIA_ANTERIOR_HORA ?? 18);
+const DAY_BEFORE_MINUTE = Number(process.env.AVISO_DIA_ANTERIOR_MINUTO ?? process.env.ENSAYO_AVISO_DIA_ANTERIOR_MINUTO ?? 0);
+const SAME_DAY_HOUR = Number(process.env.AVISO_MISMO_DIA_HORA ?? process.env.ENSAYO_AVISO_MISMO_DIA_HORA ?? 8);
+const SAME_DAY_MINUTE = Number(process.env.AVISO_MISMO_DIA_MINUTO ?? process.env.ENSAYO_AVISO_MISMO_DIA_MINUTO ?? 0);
 const EVENT_PROCESSING_LEASE_MS = 8 * 60 * 1000;
 
 function fail(message) {
@@ -136,10 +136,22 @@ function parseHora(hora) {
 }
 
 function fechaEnsayo(item) {
-  const info = parseMesAnio(item.mes_anio);
   const hora = parseHora(item.hora_ensayo);
+  if (!hora) return null;
+
+  // Los documentos nuevos guardan la fecha real del ensayo. Se mantiene
+  // compatibilidad con ensayos antiguos que solo guardaban dia_ensayo y mes_anio.
+  const fechaISO = String(item.fecha_ensayo || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(fechaISO)) {
+    const dt = DateTime.fromISO(fechaISO, { zone: APP_TIMEZONE }).set({
+      hour: hora.hour, minute: hora.minute, second: 0, millisecond: 0
+    });
+    if (dt.isValid && dt.toISODate() === fechaISO) return dt;
+  }
+
+  const info = parseMesAnio(item.mes_anio_ensayo || item.mes_anio);
   const dia = Number(item.dia_ensayo);
-  if (!info || !hora || !Number.isInteger(dia)) return null;
+  if (!info || !Number.isInteger(dia)) return null;
   const dt = DateTime.fromObject({
     year: info.anio,
     month: info.mes,
@@ -333,7 +345,11 @@ async function enviarNotificacion(destinatarios, { title, body, type, extra = {}
           type: String(type),
           url: PUBLIC_APP_URL,
           ...Object.fromEntries(Object.entries(extra).map(([k, v]) => [k, String(v)]))
-        }
+        },
+        // Los avisos son contenido visible y sensible al horario. La prioridad
+        // alta reduce retrasos del navegador cuando la app está en segundo plano.
+        webpush: { headers: { Urgency: 'high' } },
+        android: { priority: 'high' }
       });
     }
   }
@@ -526,7 +542,8 @@ async function procesarSuplencias(now, initializedAtMs) {
 
       for (const miembro of equipo) {
         if (!miembro?.suplencia_solicitada || !miembro?.id_usuario) continue;
-        const eventoMs = toMillis(miembro.suplencia_solicitada_en);
+        const eventoMs = toMillis(miembro.suplencia_solicitada_en)
+          ?? toMillis(data.suplencias_solicitadas_en?.[miembro.id_usuario]);
         if (eventoMs === null || eventoMs <= initializedAtMs) continue;
 
         const eventKey = `suplencia|${docSnap.id}|${miembro.id_usuario}|${eventoMs}`;
@@ -593,6 +610,41 @@ async function procesarCanciones(now, initializedAtMs) {
     }
   }
   return procesadas;
+}
+
+
+async function procesarActualizacionBiblioteca(initializedAtMs) {
+  const metaSnap = await db.collection('configuracion').doc('general').get();
+  if (!metaSnap.exists) return 0;
+  const data = metaSnap.data() || {};
+  const updatedMs = toMillis(data.biblioteca_actualizado_en);
+  const revision = Number(data.biblioteca_revision || 0);
+  if (!Number.isSafeInteger(revision) || revision < 1 || updatedMs === null || updatedMs <= initializedAtMs) return 0;
+
+  const actorUid = String(data.biblioteca_actualizado_por || '').trim();
+  let actor = 'Un director u operador';
+  if (actorUid) {
+    const actorSnap = await db.collection('usuarios').doc(actorUid).get();
+    if (actorSnap.exists) actor = actorSnap.data()?.nombre_completo || actor;
+  }
+
+  const destinatarios = (await obtenerTodosDestinatarios()).filter(user => user.uid !== actorUid);
+  const tipoCambio = String(data.biblioteca_lastChangeType || 'upsert').toLowerCase();
+  const eliminado = tipoCambio === 'delete';
+  const eventKey = `biblioteca_canciones|${revision}|${updatedMs}`;
+  const sent = await enviarEventoUnico(eventKey, {
+    title: '🎶 Biblioteca de canciones actualizada',
+    body: eliminado
+      ? `${actor} actualizó la biblioteca de canciones. Se eliminó una canción del catálogo.`
+      : `${actor} agregó o actualizó canciones en la biblioteca. Entra para consultar el repertorio disponible.`,
+    type: 'biblioteca_canciones_actualizada',
+    extra: {
+      revisionBiblioteca: revision,
+      cancionId: String(data.biblioteca_lastChangeId || ''),
+      accion: eliminado ? 'delete' : 'upsert'
+    }
+  }, destinatarios);
+  return sent ? 1 : 0;
 }
 
 
@@ -751,24 +803,37 @@ async function procesarEnsayos(now) {
       if (!ensayoDt || ensayoDt <= now || ensayoDt > now.plus({ months: 2 })) continue;
 
       const serviceKey = data.dia_servicio;
-      const serviceSnap = await db.collection('horarios_servicios')
-        .where('mes_anio', '==', data.mes_anio)
-        .where('dia', '==', Number(serviceKey))
-        .get();
-      if (serviceSnap.empty) continue;
+      let horario = null;
 
-      // Si hay varios servicios el mismo día, asociar el ensayo al servicio
-      // indicado en el propio documento. No avisar a un equipo ajeno por usar
-      // arbitrariamente el primer horario de esa fecha.
-      const nombreServicioEsperado = String(data.nombre_servicio || '').trim().toLocaleLowerCase('es');
-      const horariosCoincidentes = nombreServicioEsperado
-        ? serviceSnap.docs.filter(doc => String(doc.data()?.descripcion_servicio || '').trim().toLocaleLowerCase('es') === nombreServicioEsperado)
-        : [];
-      const horario = horariosCoincidentes.length === 1
-        ? horariosCoincidentes[0]
-        : (!nombreServicioEsperado && serviceSnap.size === 1 ? serviceSnap.docs[0] : null);
-      // Un nombre repetido o un nombre no coincidente entre varios servicios
-      // no identifica al equipo con seguridad; en ese caso no avisar al azar.
+      // Los ensayos recientes guardan horario_id para enlazar exactamente el
+      // servicio, incluso cuando el mismo día hay dos servicios con igual nombre.
+      if (data.horario_id) {
+        const horarioSnap = await db.collection('horarios_servicios').doc(String(data.horario_id)).get();
+        if (horarioSnap.exists) {
+          const horarioData = horarioSnap.data() || {};
+          if (String(horarioData.mes_anio || '') === String(data.mes_anio || '')
+              && Number(horarioData.dia) === Number(serviceKey)) {
+            horario = horarioSnap;
+          }
+        }
+      } else {
+        const serviceSnap = await db.collection('horarios_servicios')
+          .where('mes_anio', '==', data.mes_anio)
+          .where('dia', '==', Number(serviceKey))
+          .get();
+        if (serviceSnap.empty) continue;
+
+        // Compatibilidad con registros antiguos sin horario_id: resolver por
+        // nombre exacto y no asignar el ensayo a un equipo arbitrario.
+        const nombreServicioEsperado = String(data.nombre_servicio || '').trim().toLocaleLowerCase('es');
+        const horariosCoincidentes = nombreServicioEsperado
+          ? serviceSnap.docs.filter(doc => String(doc.data()?.descripcion_servicio || '').trim().toLocaleLowerCase('es') === nombreServicioEsperado)
+          : [];
+        horario = horariosCoincidentes.length === 1
+          ? horariosCoincidentes[0]
+          : (!nombreServicioEsperado && serviceSnap.size === 1 ? serviceSnap.docs[0] : null);
+      }
+
       if (!horario) {
         console.warn(`[NOTIFICACIONES] No se pudo identificar el servicio correcto para el ensayo ${docSnap.id}; no se enviará a un equipo ambiguo.`);
         continue;
@@ -804,12 +869,12 @@ async function procesarEnsayos(now) {
 
         for (const uid of ids) {
           const destinatarios = await obtenerDestinatarios([uid]);
-          const eventKey = `ensayo_recordatorio|${docSnap.id}|${uid}|${modo}`;
+          const eventKey = `ensayo_recordatorio|${docSnap.id}|${uid}|${ensayoDt.toISODate()}|${modo}`;
           const sent = await enviarEventoUnico(eventKey, {
             title,
             body,
             type: tipo,
-            extra: { horarioId: horario.id, ensayoId: docSnap.id, uid, momento: modo }
+            extra: { horarioId: horario.id, ensayoId: docSnap.id, uid, momento: modo, fechaEnsayo: ensayoDt.toISODate() }
           }, destinatarios);
           if (sent) procesadas += 1;
         }
@@ -1076,11 +1141,12 @@ async function procesarAvisosPlazoDisponibilidad(now) {
     ];
 
     for (const aviso of recordatorios) {
-      // Envío exacto en el día configurado para evitar recordatorios históricos.
-      // El inicio se anuncia si el cron vuelve a ejecutarse durante la ventana,
-      // aunque el operador haya guardado las fechas después del día de apertura.
+      // El inicio se anuncia durante la ventana abierta para recuperar una
+      // ejecución que haya fallado. El cierre también admite recuperación tardía;
+      // los avisos de 2 y 1 día conservan su fecha exacta para no dar plazos falsos.
       const esAperturaDentroDelPlazo = aviso.momento === 'apertura' && hoy >= inicioTexto && hoy <= limiteTexto;
-      if (aviso.momento === 'apertura' ? !esAperturaDentroDelPlazo : hoy !== aviso.fecha) continue;
+      const esCierrePendiente = aviso.momento === 'cerrado' && hoy >= aviso.fecha;
+      if (aviso.momento === 'apertura' ? !esAperturaDentroDelPlazo : aviso.momento === 'cerrado' ? !esCierrePendiente : hoy !== aviso.fecha) continue;
 
       const eventKey = `disponibilidad_plazo|${mesClave}|${aviso.momento}|${inicioTexto}|${limiteTexto}`;
       const destinatarios = await obtenerTodosDestinatarios();
@@ -1119,6 +1185,7 @@ async function ejecutarRevision() {
     const resultados = await Promise.allSettled([
       procesarSuplencias(inicio, initializedAtMs),
       procesarCanciones(inicio, initializedAtMs),
+      procesarActualizacionBiblioteca(initializedAtMs),
       procesarAsignaciones(inicio),
       procesarAsignacionesOracion(inicio),
       procesarEnsayos(inicio),
@@ -1134,10 +1201,10 @@ async function ejecutarRevision() {
         `${errores.length} proceso(s) de notificación fallaron.`
       );
     }
-    const [suplencias, canciones, asignaciones, oraciones, ensayos, recordatoriosManuales, aperturaMes, publicacionHorarios, plazosDisponibilidad] = resultados.map(resultado => resultado.value);
+    const [suplencias, canciones, biblioteca, asignaciones, oraciones, ensayos, recordatoriosManuales, aperturaMes, publicacionHorarios, plazosDisponibilidad] = resultados.map(resultado => resultado.value);
 
     await actualizarUltimaRevision(estado.ref);
-    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} asignaciones=${asignaciones} oraciones=${oraciones} ensayos=${ensayos} recordatoriosManuales=${recordatoriosManuales} aperturaMes=${aperturaMes} publicacionHorarios=${publicacionHorarios} avisosPlazo=${plazosDisponibilidad}`);
+    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} biblioteca=${biblioteca} asignaciones=${asignaciones} oraciones=${oraciones} ensayos=${ensayos} recordatoriosManuales=${recordatoriosManuales} aperturaMes=${aperturaMes} publicacionHorarios=${publicacionHorarios} avisosPlazo=${plazosDisponibilidad}`);
   } catch (error) {
     console.error('[NOTIFICACIONES] Error durante la revisión:', error);
     // En GitHub Actions --once debe devolver un código distinto de cero si

@@ -84,6 +84,10 @@ if (!RUN_ONCE) {
 }
 
 let cronEnCurso = false;
+// Cachés solo durante una revisión: evitan releer perfiles entre los distintos
+// recordatorios de esa ejecución sin mantener destinatarios obsoletos entre cron.
+let destinatariosPorUidCache = new Map();
+let todosDestinatariosCachePromise = null;
 
 function numeroMesClave(month) {
   return `${month.month}-${month.year}`;
@@ -239,52 +243,61 @@ async function quitarTokensInvalidos(invalidByUser) {
       await db.collection('usuarios').doc(uid).update({
         fcm_tokens: FieldValue.arrayRemove(...tokens)
       });
+      const cacheado = destinatariosPorUidCache.get(uid);
+      if (cacheado) cacheado.tokens = cacheado.tokens.filter(token => !tokens.includes(token));
     } catch (error) {
       console.warn(`[NOTIFICACIONES] No se pudieron limpiar tokens de ${uid}: ${error.message}`);
     }
   }
 }
 
+function crearDestinatarioDesdeSnapshot(snapshot) {
+  if (!snapshot?.exists) return null;
+  const data = snapshot.data() || {};
+  const tokens = data.fcm_push_enabled === false
+    ? []
+    : (Array.isArray(data.fcm_tokens) ? data.fcm_tokens.filter(Boolean) : []);
+  return {
+    uid: snapshot.id,
+    nombre: data.nombre_completo || 'Integrante',
+    es_operador: data.es_operador === true,
+    tokens: [...new Set(tokens)]
+  };
+}
+
 async function obtenerDestinatarios(userIds, excluirUid = '') {
   const uniqueIds = [...new Set((userIds || []).filter(Boolean).filter(uid => uid !== excluirUid))];
   if (!uniqueIds.length) return [];
 
-  const refs = uniqueIds.map(uid => db.collection('usuarios').doc(uid));
-  const docs = await db.getAll(...refs);
-  const destinatarios = [];
-
-  docs.forEach(snapshot => {
-    if (!snapshot.exists) return;
-    const data = snapshot.data() || {};
-    const tokens = data.fcm_push_enabled === false
-      ? []
-      : (Array.isArray(data.fcm_tokens) ? data.fcm_tokens.filter(Boolean) : []);
-    destinatarios.push({
-      uid: snapshot.id,
-      nombre: data.nombre_completo || 'Integrante',
-      tokens: [...new Set(tokens)]
+  const missingIds = uniqueIds.filter(uid => !destinatariosPorUidCache.has(uid));
+  if (missingIds.length) {
+    const refs = missingIds.map(uid => db.collection('usuarios').doc(uid));
+    const docs = await db.getAll(...refs);
+    docs.forEach(snapshot => {
+      destinatariosPorUidCache.set(snapshot.id, crearDestinatarioDesdeSnapshot(snapshot));
     });
-  });
-
-  return destinatarios;
+  }
+  return uniqueIds.map(uid => destinatariosPorUidCache.get(uid)).filter(Boolean);
 }
 
 async function obtenerTodosDestinatarios(filtro) {
-  const snap = await db.collection('usuarios').get();
-  const destinatarios = [];
-  snap.forEach(snapshot => {
-    const data = snapshot.data() || {};
-    if (filtro && !filtro(data)) return;
-    const tokens = data.fcm_push_enabled === false
-      ? []
-      : (Array.isArray(data.fcm_tokens) ? data.fcm_tokens.filter(Boolean) : []);
-    destinatarios.push({
-      uid: snapshot.id,
-      nombre: data.nombre_completo || 'Integrante',
-      tokens: [...new Set(tokens)]
+  if (!todosDestinatariosCachePromise) {
+    todosDestinatariosCachePromise = db.collection('usuarios').get().then(snap => {
+      const destinatarios = [];
+      snap.forEach(snapshot => {
+        const destinatario = crearDestinatarioDesdeSnapshot(snapshot);
+        if (!destinatario) return;
+        destinatarios.push(destinatario);
+        destinatariosPorUidCache.set(destinatario.uid, destinatario);
+      });
+      return destinatarios;
+    }).catch(error => {
+      todosDestinatariosCachePromise = null;
+      throw error;
     });
-  });
-  return destinatarios;
+  }
+  const destinatarios = await todosDestinatariosCachePromise;
+  return filtro ? destinatarios.filter(user => filtro({ es_operador: user.es_operador, uid: user.uid, nombre_completo: user.nombre })) : [...destinatarios];
 }
 
 async function registrarNotificacionEnCentro(uid, eventKey, notification) {
@@ -318,24 +331,28 @@ async function registrarNotificacionEnCentro(uid, eventKey, notification) {
 async function enviarNotificacion(destinatarios, { title, body, type, extra = {} }, eventKey = '') {
   if (!destinatarios.length) return { successCount: 0, failureCount: 0, destinatarios: 0, tokensDisponibles: 0, erroresCentro: 0 };
 
-  // El historial se escribe en la misma cuenta de cada destinatario del push,
-  // incluso si la notificación llega a varios de sus dispositivos.
+  // Primero se persiste el aviso en cada perfil. Un destinatario cuyo historial
+  // no pudo guardarse no recibe push: así nunca ve un aviso que luego no pueda
+  // encontrar dentro de la aplicación.
   const guardados = await Promise.allSettled(destinatarios.map(user =>
     registrarNotificacionEnCentro(user.uid, eventKey, { title, body, type, extra })
   ));
   let erroresCentro = 0;
+  const destinatariosConHistorial = [];
   guardados.forEach((resultado, index) => {
-    if (resultado.status === 'rejected' || (resultado.status === 'fulfilled' && resultado.value === false)) {
-      erroresCentro += 1;
-      const detalle = resultado.status === 'rejected'
-        ? (resultado.reason?.message || resultado.reason)
-        : 'el perfil del usuario ya no existe';
-      console.warn(`[NOTIFICACIONES] No se guardó el aviso en el centro de ${destinatarios[index]?.uid}: ${detalle}`);
+    if (resultado.status === 'fulfilled' && resultado.value === true) {
+      destinatariosConHistorial.push(destinatarios[index]);
+      return;
     }
+    erroresCentro += 1;
+    const detalle = resultado.status === 'rejected'
+      ? (resultado.reason?.message || resultado.reason)
+      : 'el perfil del usuario ya no existe';
+    console.warn(`[NOTIFICACIONES] No se guardó el aviso en el centro de ${destinatarios[index]?.uid}: ${detalle}`);
   });
 
   const mensajes = [];
-  for (const user of destinatarios) {
+  for (const user of destinatariosConHistorial) {
     for (const token of user.tokens) {
       mensajes.push({
         token,
@@ -346,30 +363,26 @@ async function enviarNotificacion(destinatarios, { title, body, type, extra = {}
           url: PUBLIC_APP_URL,
           ...Object.fromEntries(Object.entries(extra).map(([k, v]) => [k, String(v)]))
         },
-        // Los avisos son contenido visible y sensible al horario. La prioridad
-        // alta reduce retrasos del navegador cuando la app está en segundo plano.
         webpush: { headers: { Urgency: 'high' } },
         android: { priority: 'high' }
       });
     }
   }
-  if (!mensajes.length) return { successCount: 0, failureCount: 0, destinatarios: destinatarios.length, tokensDisponibles: 0, erroresCentro };
+  if (!mensajes.length) return {
+    successCount: 0, failureCount: 0, destinatarios: destinatarios.length,
+    tokensDisponibles: 0, erroresCentro
+  };
 
   let successCount = 0;
   let failureCount = 0;
   const invalidByUser = new Map();
+  const mensajeOwners = [];
+  for (const user of destinatariosConHistorial) {
+    for (const token of user.tokens) mensajeOwners.push({ uid: user.uid, token });
+  }
 
   for (let i = 0; i < mensajes.length; i += 500) {
     const chunk = mensajes.slice(i, i + 500);
-    const indexToUser = [];
-    let cursor = 0;
-    for (const user of destinatarios) {
-      for (const token of user.tokens) {
-        if (cursor >= i && cursor < i + chunk.length) indexToUser.push({ index: cursor - i, uid: user.uid, token });
-        cursor += 1;
-      }
-    }
-
     const response = await messaging.sendEach(chunk);
     response.responses.forEach((result, localIndex) => {
       if (result.success) {
@@ -377,7 +390,7 @@ async function enviarNotificacion(destinatarios, { title, body, type, extra = {}
         return;
       }
       failureCount += 1;
-      const target = indexToUser[localIndex];
+      const target = mensajeOwners[i + localIndex];
       if (target && esTokenInvalido(result.error)) {
         if (!invalidByUser.has(target.uid)) invalidByUser.set(target.uid, []);
         invalidByUser.get(target.uid).push(target.token);
@@ -538,7 +551,8 @@ async function procesarSuplencias(now, initializedAtMs) {
       const dia = Number(data.dia);
       if (!info || !Number.isInteger(dia)) continue;
       const fechaServicio = DateTime.fromObject({ year: info.anio, month: info.mes, day: dia }, { zone: APP_TIMEZONE });
-      const fechaTexto = fechaServicio.isValid ? formatoFecha(fechaServicio) : `día ${dia}`;
+      if (!fechaServicio.isValid || fechaServicio.startOf('day').toMillis() < now.startOf('day').toMillis()) continue;
+      const fechaTexto = formatoFecha(fechaServicio);
 
       for (const miembro of equipo) {
         if (!miembro?.suplencia_solicitada || !miembro?.id_usuario) continue;
@@ -547,7 +561,8 @@ async function procesarSuplencias(now, initializedAtMs) {
         if (eventoMs === null || eventoMs <= initializedAtMs) continue;
 
         const eventKey = `suplencia|${docSnap.id}|${miembro.id_usuario}|${eventoMs}`;
-        const destinatarios = await obtenerTodosDestinatarios(dataUsuario => !!dataUsuario.es_operador);
+        if (await eventoYaCompletado(eventKey)) continue;
+        const destinatarios = await obtenerTodosDestinatarios(dataUsuario => dataUsuario.es_operador === true);
         const sent = await enviarEventoUnico(eventKey, {
           title: '🔄 Solicitud de suplencia',
           body: `${miembro.nombre || 'Un integrante'} solicita suplencia para ${servicio} — ${fechaTexto}.`,
@@ -596,15 +611,84 @@ async function procesarCanciones(now, initializedAtMs) {
         ? DateTime.fromObject({ year: info.anio, month: info.mes, day: dia }, { zone: APP_TIMEZONE })
         : null;
       const fechaTexto = fechaServicio?.isValid ? formatoFecha(fechaServicio) : `día ${dia}`;
+      const eventKey = `canciones|${docSnap.id}|${updatedMs}`;
+      if (await eventoYaCompletado(eventKey)) continue;
       const actor = await nombreUsuario(actorUid);
       const destinatarios = await obtenerDestinatarios(ids, actorUid);
-      const eventKey = `canciones|${docSnap.id}|${updatedMs}`;
 
       const sent = await enviarEventoUnico(eventKey, {
         title: '🎶 Repertorio actualizado',
         body: `${actor} actualizó las canciones para ${data.descripcion_servicio || 'el servicio'} — ${fechaTexto}.`,
         type: 'canciones_actualizadas',
         extra: { horarioId: docSnap.id, recordatorioId: `${docSnap.id}-${updatedMs}` }
+      }, destinatarios);
+      if (sent) procesadas += 1;
+    }
+  }
+  return procesadas;
+}
+
+
+async function procesarNotasDirector(now, initializedAtMs) {
+  const monthKeys = [numeroMesClave(now), mesSiguienteClave(now)];
+  const snapshots = await Promise.all(monthKeys.map(key =>
+    db.collection('horarios_servicios').where('mes_anio', '==', key).get()
+  ));
+  const nombresCache = new Map();
+  let procesadas = 0;
+
+  async function nombreUsuario(uid) {
+    if (!uid) return 'El director/operador';
+    if (nombresCache.has(uid)) return nombresCache.get(uid);
+    const snap = await db.collection('usuarios').doc(uid).get();
+    const nombre = snap.exists
+      ? (snap.data()?.nombre_completo || 'El director/operador')
+      : 'El director/operador';
+    nombresCache.set(uid, nombre);
+    return nombre;
+  }
+
+  for (const snap of snapshots) {
+    for (const docSnap of snap.docs) {
+      const data = docSnap.data() || {};
+      const updatedMs = toMillis(data.notas_actualizadas_en);
+      if (updatedMs === null || updatedMs <= initializedAtMs) continue;
+
+      const info = parseMesAnio(data.mes_anio);
+      const dia = Number(data.dia);
+      if (!info || !Number.isInteger(dia)) continue;
+      const fechaServicio = DateTime.fromObject({
+        year: info.anio, month: info.mes, day: dia
+      }, { zone: APP_TIMEZONE }).startOf('day');
+      // Las notas de servicios ya celebrados quedan en el historial, pero no
+      // generan avisos tardíos que ya no serían útiles para el equipo.
+      if (!fechaServicio.isValid || fechaServicio < now.startOf('day')) continue;
+
+      const actorUid = String(data.notas_actualizadas_por || '').trim();
+      const equipo = Array.isArray(data.equipo) ? data.equipo : [];
+      const ids = [...new Set(equipo.map(miembro => miembro?.id_usuario).filter(Boolean))];
+      if (!ids.length) continue;
+
+      const eventKey = `notas_director|${docSnap.id}|${updatedMs}`;
+      if (await eventoYaCompletado(eventKey)) continue;
+
+      const actor = await nombreUsuario(actorUid);
+      // Solo se avisa a las personas asignadas al servicio; quien editó las
+      // notas no recibe su propio aviso.
+      const destinatarios = await obtenerDestinatarios(ids, actorUid);
+      if (!destinatarios.length) continue;
+
+      const fechaTexto = formatoFecha(fechaServicio);
+      const servicio = data.descripcion_servicio || 'el servicio';
+      const sent = await enviarEventoUnico(eventKey, {
+        title: '📝 Notas del servicio actualizadas',
+        body: `${actor} actualizó las notas de arreglo para ${servicio} — ${fechaTexto}. Entra en A.S.A.F. para consultar las indicaciones.`,
+        type: 'notas_director_actualizadas',
+        extra: {
+          horarioId: docSnap.id,
+          recordatorioId: `${docSnap.id}-${updatedMs}`,
+          fechaServicio: fechaServicio.toISODate()
+        }
       }, destinatarios);
       if (sent) procesadas += 1;
     }
@@ -622,6 +706,8 @@ async function procesarActualizacionBiblioteca(initializedAtMs) {
   if (!Number.isSafeInteger(revision) || revision < 1 || updatedMs === null || updatedMs <= initializedAtMs) return 0;
 
   const actorUid = String(data.biblioteca_actualizado_por || '').trim();
+  const eventKey = `biblioteca_canciones|${revision}|${updatedMs}`;
+  if (await eventoYaCompletado(eventKey)) return 0;
   let actor = 'Un director u operador';
   if (actorUid) {
     const actorSnap = await db.collection('usuarios').doc(actorUid).get();
@@ -631,7 +717,6 @@ async function procesarActualizacionBiblioteca(initializedAtMs) {
   const destinatarios = (await obtenerTodosDestinatarios()).filter(user => user.uid !== actorUid);
   const tipoCambio = String(data.biblioteca_lastChangeType || 'upsert').toLowerCase();
   const eliminado = tipoCambio === 'delete';
-  const eventKey = `biblioteca_canciones|${revision}|${updatedMs}`;
   const sent = await enviarEventoUnico(eventKey, {
     title: '🎶 Biblioteca de canciones actualizada',
     body: eliminado
@@ -691,7 +776,6 @@ async function procesarAsignaciones(now) {
     for (const docSnap of snap.docs) {
       const data = docSnap.data() || {};
       if (!mesesVisibles.has(String(data.mes_anio || ''))) continue;
-      if (data.actualizado_por_reinicio_disponibilidad === true) continue;
 
       const info = parseMesAnio(data.mes_anio);
       const dia = Number(data.dia);
@@ -728,8 +812,9 @@ async function procesarAsignaciones(now) {
             : 'asignacion_mismo_dia';
 
         for (const uid of ids) {
-          const destinatarios = await obtenerDestinatarios([uid]);
           const eventKey = `asignacion_recordatorio|${docSnap.id}|${uid}|${fechaServicio.toISODate()}|${modo}`;
+          if (await eventoYaCompletado(eventKey)) continue;
+          const destinatarios = await obtenerDestinatarios([uid]);
           const sent = await enviarEventoUnico(eventKey, {
             title,
             body,
@@ -770,8 +855,9 @@ async function procesarAsignacionesOracion(now) {
           : modo === 'dia_anterior'
             ? 'oracion_dia_anterior'
             : 'oracion_mismo_dia';
-        const destinatarios = await obtenerDestinatarios([uid]);
         const eventKey = `oracion_recordatorio|${docSnap.id}|${uid}|${fechaTextoISO}|${modo}`;
+        if (await eventoYaCompletado(eventKey)) continue;
+        const destinatarios = await obtenerDestinatarios([uid]);
         const sent = await enviarEventoUnico(eventKey, {
           title: esDiaAnterior ? '🎙️ Mañana te corresponde la oración' : '🎙️ Hoy te corresponde la oración',
           body: `${esDiaAnterior ? 'Mañana' : 'Hoy'} te corresponde enviar el audio de oración al grupo (${fechaLegible}).`,
@@ -868,8 +954,9 @@ async function procesarEnsayos(now) {
             : 'aviso_ensayo_mismo_dia';
 
         for (const uid of ids) {
-          const destinatarios = await obtenerDestinatarios([uid]);
           const eventKey = `ensayo_recordatorio|${docSnap.id}|${uid}|${ensayoDt.toISODate()}|${modo}`;
+          if (await eventoYaCompletado(eventKey)) continue;
+          const destinatarios = await obtenerDestinatarios([uid]);
           const sent = await enviarEventoUnico(eventKey, {
             title,
             body,
@@ -956,6 +1043,17 @@ async function procesarRecordatoriosManuales(now) {
         });
         continue;
       }
+      const eventKey = `recordatorio_manual_horario|${solicitudSnap.id}|${horarioId}`;
+      if (await eventoYaCompletado(eventKey)) {
+        await solicitudRef.update({
+          estado: 'enviado',
+          error: FieldValue.delete(),
+          ultimo_error: FieldValue.delete(),
+          procesado_en: FieldValue.serverTimestamp()
+        });
+        procesadas += 1;
+        continue;
+      }
       const destinatarios = await obtenerDestinatarios(ids);
       if (!destinatarios.length) {
         await solicitudRef.update({
@@ -968,7 +1066,6 @@ async function procesarRecordatoriosManuales(now) {
 
       const fechaTexto = formatoFecha(fechaServicio);
       const servicio = String(horario.descripcion_servicio || 'el servicio');
-      const eventKey = `recordatorio_manual_horario|${solicitudSnap.id}|${horarioId}`;
       const notification = {
         title: '🔔 Recordatorio del servicio',
         body: `Recuerda que estás asignado a ${servicio} el ${fechaTexto}. Entra en Oasis App para consultar los detalles de tu horario.`,
@@ -1043,6 +1140,7 @@ async function procesarPublicacionHorarios(initializedAtMs) {
       ? DateTime.fromObject({ year: info.anio, month: info.mes, day: 1 }, { zone: APP_TIMEZONE }).setLocale('es').toFormat("LLLL 'de' yyyy")
       : mesClave;
     const eventKey = `horarios_visibles|${mesClave}|${visibleMs}`;
+    if (await eventoYaCompletado(eventKey)) continue;
     const destinatarios = await obtenerTodosDestinatarios();
     const sent = await enviarEventoUnico(eventKey, {
       title: '📅 ¡Los horarios ya están visibles!',
@@ -1074,6 +1172,7 @@ async function procesarAperturaMesSiguiente(now, initializedAtMs) {
   if (openedMs === null || openedMs <= initializedAtMs) return 0;
 
   const eventKey = `disponibilidad_mes_siguiente|${nextMonthKey}|${openedMs}`;
+  if (await eventoYaCompletado(eventKey)) return 0;
   const destinatarios = await obtenerTodosDestinatarios();
   const sent = await enviarEventoUnico(eventKey, {
     title: '🗓️ Disponibilidades abiertas',
@@ -1149,6 +1248,7 @@ async function procesarAvisosPlazoDisponibilidad(now) {
       if (aviso.momento === 'apertura' ? !esAperturaDentroDelPlazo : aviso.momento === 'cerrado' ? !esCierrePendiente : hoy !== aviso.fecha) continue;
 
       const eventKey = `disponibilidad_plazo|${mesClave}|${aviso.momento}|${inicioTexto}|${limiteTexto}`;
+      if (await eventoYaCompletado(eventKey)) continue;
       const destinatarios = await obtenerTodosDestinatarios();
       const sent = await enviarEventoUnico(eventKey, {
         title: aviso.title,
@@ -1177,6 +1277,8 @@ async function ejecutarRevision() {
 
     const estadoSnap = await estado.ref.get();
     const estadoData = estadoSnap.data() || {};
+    destinatariosPorUidCache = new Map();
+    todosDestinatariosCachePromise = null;
     const initializedAtMs = toMillis(estadoData.inicializado_en) || 0;
 
     // Esperar a que terminen todos los procesadores aun cuando uno falle;
@@ -1185,6 +1287,7 @@ async function ejecutarRevision() {
     const resultados = await Promise.allSettled([
       procesarSuplencias(inicio, initializedAtMs),
       procesarCanciones(inicio, initializedAtMs),
+      procesarNotasDirector(inicio, initializedAtMs),
       procesarActualizacionBiblioteca(initializedAtMs),
       procesarAsignaciones(inicio),
       procesarAsignacionesOracion(inicio),
@@ -1201,10 +1304,10 @@ async function ejecutarRevision() {
         `${errores.length} proceso(s) de notificación fallaron.`
       );
     }
-    const [suplencias, canciones, biblioteca, asignaciones, oraciones, ensayos, recordatoriosManuales, aperturaMes, publicacionHorarios, plazosDisponibilidad] = resultados.map(resultado => resultado.value);
+    const [suplencias, canciones, notasDirector, biblioteca, asignaciones, oraciones, ensayos, recordatoriosManuales, aperturaMes, publicacionHorarios, plazosDisponibilidad] = resultados.map(resultado => resultado.value);
 
     await actualizarUltimaRevision(estado.ref);
-    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} biblioteca=${biblioteca} asignaciones=${asignaciones} oraciones=${oraciones} ensayos=${ensayos} recordatoriosManuales=${recordatoriosManuales} aperturaMes=${aperturaMes} publicacionHorarios=${publicacionHorarios} avisosPlazo=${plazosDisponibilidad}`);
+    console.log(`[NOTIFICACIONES] Revisión ${inicio.toFormat('yyyy-LL-dd HH:mm')} | suplencias=${suplencias} canciones=${canciones} notasDirector=${notasDirector} biblioteca=${biblioteca} asignaciones=${asignaciones} oraciones=${oraciones} ensayos=${ensayos} recordatoriosManuales=${recordatoriosManuales} aperturaMes=${aperturaMes} publicacionHorarios=${publicacionHorarios} avisosPlazo=${plazosDisponibilidad}`);
   } catch (error) {
     console.error('[NOTIFICACIONES] Error durante la revisión:', error);
     // En GitHub Actions --once debe devolver un código distinto de cero si

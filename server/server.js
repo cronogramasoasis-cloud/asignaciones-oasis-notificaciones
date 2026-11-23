@@ -175,7 +175,7 @@ function hashEventKey(eventKey) {
 function eventoCompletado(data) {
   if (!data || typeof data !== 'object') return false;
   if (data.estado === 'pendiente' || data.estado === 'procesando') return false;
-  if (data.estado === 'enviado' || data.estado === 'solo_centro') return true;
+  if (data.estado === 'enviado' || data.estado === 'solo_centro' || data.estado === 'sin_pendientes') return true;
   if (data.solo_centro === true) return true;
   return toMillis(data.enviado_en) !== null && Number(data.envios_exitosos || 0) > 0;
 }
@@ -245,6 +245,22 @@ async function quitarTokensInvalidos(invalidByUser) {
   }
 }
 
+function obtenerIdsEquipoNotificables(equipo) {
+  const suplenciasPorUid = new Map();
+  for (const miembro of (Array.isArray(equipo) ? equipo : [])) {
+    const uid = String(miembro?.id_usuario || '').trim();
+    if (!uid) continue;
+    // Una sola entrada con suplencia pendiente basta para excluir al UID entero,
+    // aunque datos antiguos hayan duplicado a la persona en el mismo equipo.
+    suplenciasPorUid.set(uid, suplenciasPorUid.get(uid) === true || miembro?.suplencia_solicitada === true);
+  }
+  // El equipo actual es la fuente de verdad: una persona retirada del array
+  // deja de ser destinataria; una suplencia pendiente también la excluye.
+  return [...suplenciasPorUid.entries()]
+    .filter(([, suplenciaPendiente]) => !suplenciaPendiente)
+    .map(([uid]) => uid);
+}
+
 async function obtenerDestinatarios(userIds, excluirUid = '') {
   const uniqueIds = [...new Set((userIds || []).filter(Boolean).filter(uid => uid !== excluirUid))];
   if (!uniqueIds.length) return [];
@@ -285,6 +301,50 @@ async function obtenerTodosDestinatarios(filtro) {
     });
   });
   return destinatarios;
+}
+
+async function obtenerDestinatariosPendientesDisponibilidad(mesClave) {
+  const [usuariosSnap, disponibilidadesSnap] = await Promise.all([
+    db.collection('usuarios').get(),
+    db.collection('disponibilidades').where('mes_anio', '==', mesClave).get()
+  ]);
+
+  // La app considera completada una disponibilidad únicamente en estado enviado.
+  // Los documentos reiniciados permanecen como pendiente y deben recibir aviso.
+  const enviados = new Set();
+  disponibilidadesSnap.forEach(docSnap => {
+    const data = docSnap.data() || {};
+    if (data.estado !== 'enviado') return;
+    const uid = String(data.id_usuario || '').trim();
+    if (uid) enviados.add(uid);
+  });
+
+  const destinatarios = [];
+  usuariosSnap.forEach(userSnap => {
+    if (enviados.has(userSnap.id)) return;
+    const data = userSnap.data() || {};
+    const tokens = data.fcm_push_enabled === false
+      ? []
+      : (Array.isArray(data.fcm_tokens) ? [...new Set(data.fcm_tokens.filter(Boolean))] : []);
+    destinatarios.push({
+      uid: userSnap.id,
+      nombre: data.nombre_completo || 'Integrante',
+      tokens
+    });
+  });
+  return destinatarios;
+}
+
+async function marcarEventoSinPendientes(eventKey, tipo) {
+  const ref = db.collection('notificaciones_enviadas').doc(hashEventKey(eventKey));
+  await ref.set({
+    event_key: eventKey,
+    tipo: tipo || 'disponibilidad',
+    estado: 'sin_pendientes',
+    destinatarios: 0,
+    procesado_en: FieldValue.serverTimestamp(),
+    ultima_actualizacion: FieldValue.serverTimestamp()
+  }, { merge: true });
 }
 
 async function registrarNotificacionEnCentro(uid, eventKey, notification) {
@@ -567,7 +627,10 @@ async function procesarSuplencias(now, initializedAtMs) {
 
 async function procesarCanciones(now, initializedAtMs) {
   const monthKeys = [numeroMesClave(now), mesSiguienteClave(now)];
-  const snapshots = await Promise.all(monthKeys.map(key => db.collection('horarios_servicios').where('mes_anio', '==', key).get()));
+  const [snapshots, mesesVisibles] = await Promise.all([
+    Promise.all(monthKeys.map(key => db.collection('horarios_servicios').where('mes_anio', '==', key).get())),
+    obtenerMesesConHorariosVisibles()
+  ]);
   const cacheUsuarios = new Map();
   let procesadas = 0;
 
@@ -586,8 +649,11 @@ async function procesarCanciones(now, initializedAtMs) {
       const updatedMs = toMillis(data.canciones_actualizadas_en);
       const actorUid = data.canciones_actualizadas_por || '';
       if (updatedMs === null || updatedMs <= initializedAtMs) continue;
-      const equipo = Array.isArray(data.equipo) ? data.equipo : [];
-      const ids = equipo.map(m => m?.id_usuario).filter(Boolean);
+      // No avisar cambios de repertorio de horarios todavía ocultos ni a quien
+      // ya pidió suplencia. El equipo actual y su estado de suplencia son la
+      // única fuente de destinatarios válidos.
+      if (!mesesVisibles.has(String(data.mes_anio || ''))) continue;
+      const ids = obtenerIdsEquipoNotificables(data.equipo);
       if (!ids.length) continue;
 
       const info = parseMesAnio(data.mes_anio);
@@ -709,7 +775,7 @@ async function procesarAsignaciones(now) {
       if (!modos.length) continue;
 
       const equipo = Array.isArray(data.equipo) ? data.equipo : [];
-      const ids = [...new Set(equipo.map(miembro => miembro?.id_usuario).filter(Boolean))];
+      const ids = obtenerIdsEquipoNotificables(equipo);
       if (!ids.length) continue;
 
       const fechaTexto = formatoFecha(fechaServicio);
@@ -839,9 +905,7 @@ async function procesarEnsayos(now) {
         continue;
       }
       const horarioData = horario.data() || {};
-      const ids = [...new Set((Array.isArray(horarioData.equipo) ? horarioData.equipo : [])
-        .map(miembro => miembro?.id_usuario)
-        .filter(Boolean))];
+      const ids = obtenerIdsEquipoNotificables(horarioData.equipo);
       if (!ids.length) continue;
 
       const modos = momentosAvisoCalendario(ensayoDt, now);
@@ -884,6 +948,84 @@ async function procesarEnsayos(now) {
   return procesadas;
 }
 
+async function procesarSolicitudRecordatorioDisponibilidad(solicitudSnap, solicitud, now) {
+  const solicitudRef = solicitudSnap.ref;
+  const mesClave = String(solicitud.mes_anio || '').trim();
+  const info = parseMesAnio(mesClave);
+  if (!info || !Number.isInteger(info.anio) || info.anio < 2000 || info.anio > 2200) {
+    await solicitudRef.update({
+      estado: 'error',
+      error: 'La solicitud de disponibilidad contiene un mes inválido.',
+      procesado_en: FieldValue.serverTimestamp()
+    });
+    return true;
+  }
+  const inicioMes = DateTime.fromObject({ year: info.anio, month: info.mes, day: 1 }, { zone: APP_TIMEZONE }).startOf('day');
+  if (!inicioMes.isValid || inicioMes.endOf('month') < now.startOf('day')) {
+    await solicitudRef.update({
+      estado: 'expirado',
+      error: 'El mes de disponibilidad ya terminó.',
+      procesado_en: FieldValue.serverTimestamp()
+    });
+    return true;
+  }
+  const mesesPermitidos = new Set([numeroMesClave(now), mesSiguienteClave(now)]);
+  if (!mesesPermitidos.has(mesClave)) {
+    await solicitudRef.update({
+      estado: 'error',
+      error: 'Solo se permiten recordatorios del mes actual o del siguiente.',
+      procesado_en: FieldValue.serverTimestamp()
+    });
+    return true;
+  }
+
+  const destinatarios = await obtenerDestinatariosPendientesDisponibilidad(mesClave);
+
+  if (!destinatarios.length) {
+    await solicitudRef.update({
+      estado: 'sin_pendientes',
+      destinatarios: 0,
+      error: FieldValue.delete(),
+      procesado_en: FieldValue.serverTimestamp()
+    });
+    return true;
+  }
+
+  const nombreMes = inicioMes.setLocale('es').toFormat("LLLL 'de' yyyy");
+  const eventKey = `recordatorio_disponibilidad_manual|${solicitudSnap.id}|${mesClave}`;
+  const notification = {
+    title: '🗓️ Recordatorio de disponibilidad',
+    body: `Aún no has enviado tu disponibilidad de ${nombreMes}. Entra en A.S.A.F. y completa el formulario para que puedan organizar los horarios.`,
+    type: 'recordatorio_disponibilidad_manual',
+    extra: {
+      mes_anio: mesClave,
+      solicitudId: solicitudSnap.id,
+      recordatorioTipo: 'disponibilidad'
+    }
+  };
+  const enviado = await enviarEventoUnico(eventKey, notification, destinatarios);
+  const completado = enviado || await eventoYaCompletado(eventKey);
+  if (completado) {
+    await solicitudRef.update({
+      estado: 'enviado',
+      destinatarios: destinatarios.length,
+      error: FieldValue.delete(),
+      ultimo_error: FieldValue.delete(),
+      procesado_en: FieldValue.serverTimestamp(),
+      ultimo_intento_en: FieldValue.serverTimestamp()
+    });
+  } else {
+    await solicitudRef.update({
+      estado: 'pendiente',
+      destinatarios: destinatarios.length,
+      intentos: FieldValue.increment(1),
+      ultimo_error: 'No se completó la entrega a todos los integrantes; se reintentará.',
+      ultimo_intento_en: FieldValue.serverTimestamp()
+    });
+  }
+  return true;
+}
+
 async function procesarRecordatoriosManuales(now) {
   // Leer todas las solicitudes pendientes evita que una tanda antigua con errores
   // deje solicitudes más recientes esperando indefinidamente detrás del límite.
@@ -897,6 +1039,11 @@ async function procesarRecordatoriosManuales(now) {
     const solicitudRef = solicitudSnap.ref;
     const horarioId = String(solicitud.horario_id || '').trim();
     try {
+      if (solicitud.tipo_solicitud === 'disponibilidad') {
+        await procesarSolicitudRecordatorioDisponibilidad(solicitudSnap, solicitud, now);
+        procesadas += 1;
+        continue;
+      }
       if (!horarioId) {
         await solicitudRef.update({
           estado: 'error',
@@ -917,6 +1064,18 @@ async function procesarRecordatoriosManuales(now) {
       }
 
       const horario = horarioSnap.data() || {};
+      const mesHorario = String(horario.mes_anio || '').trim();
+      const publicacionSnap = mesHorario
+        ? await db.collection('publicaciones_horarios').doc(mesHorario).get()
+        : null;
+      if (!publicacionSnap?.exists || publicacionSnap.data()?.visible !== true) {
+        await solicitudRef.update({
+          estado: 'no_publicado',
+          error: 'El horario ya no está publicado; no se enviaron recordatorios.',
+          procesado_en: FieldValue.serverTimestamp()
+        });
+        continue;
+      }
       const info = parseMesAnio(horario.mes_anio);
       const dia = Number(horario.dia);
       if (!info || !Number.isInteger(dia)) {
@@ -945,9 +1104,7 @@ async function procesarRecordatoriosManuales(now) {
         continue;
       }
 
-      const ids = [...new Set((Array.isArray(horario.equipo) ? horario.equipo : [])
-        .map(miembro => miembro?.id_usuario)
-        .filter(Boolean))];
+      const ids = obtenerIdsEquipoNotificables(horario.equipo);
       if (!ids.length) {
         await solicitudRef.update({
           estado: 'sin_destinatarios',
@@ -1074,7 +1231,12 @@ async function procesarAperturaMesSiguiente(now, initializedAtMs) {
   if (openedMs === null || openedMs <= initializedAtMs) return 0;
 
   const eventKey = `disponibilidad_mes_siguiente|${nextMonthKey}|${openedMs}`;
-  const destinatarios = await obtenerTodosDestinatarios();
+  if (await eventoYaCompletado(eventKey)) return 0;
+  const destinatarios = await obtenerDestinatariosPendientesDisponibilidad(nextMonthKey);
+  if (!destinatarios.length) {
+    await marcarEventoSinPendientes(eventKey, 'disponibilidad_mes_siguiente_abierta');
+    return 0;
+  }
   const sent = await enviarEventoUnico(eventKey, {
     title: '🗓️ Disponibilidades abiertas',
     body: `Ya puedes llenar tu disponibilidad para ${nextMonth.setLocale('es').toFormat("LLLL 'de' yyyy")}.`,
@@ -1149,7 +1311,14 @@ async function procesarAvisosPlazoDisponibilidad(now) {
       if (aviso.momento === 'apertura' ? !esAperturaDentroDelPlazo : aviso.momento === 'cerrado' ? !esCierrePendiente : hoy !== aviso.fecha) continue;
 
       const eventKey = `disponibilidad_plazo|${mesClave}|${aviso.momento}|${inicioTexto}|${limiteTexto}`;
-      const destinatarios = await obtenerTodosDestinatarios();
+      // No releer usuarios/disponibilidades en cada ejecución del cron una vez
+      // completado el evento o si todos ya enviaron su formulario.
+      if (await eventoYaCompletado(eventKey)) continue;
+      const destinatarios = await obtenerDestinatariosPendientesDisponibilidad(mesClave);
+      if (!destinatarios.length) {
+        await marcarEventoSinPendientes(eventKey, aviso.type);
+        continue;
+      }
       const sent = await enviarEventoUnico(eventKey, {
         title: aviso.title,
         body: aviso.body,

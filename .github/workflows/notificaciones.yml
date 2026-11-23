@@ -8,14 +8,10 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: oasis-notificaciones-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   enviar-notificaciones:
     runs-on: ubuntu-slim
-    timeout-minutes: 10
+    timeout-minutes: 6
 
     steps:
       - name: Descargar código
@@ -25,7 +21,8 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
-          package-manager-cache: false
+          cache: 'npm'
+          cache-dependency-path: server/package.json
 
       - name: Instalar dependencias
         working-directory: server
